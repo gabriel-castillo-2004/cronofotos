@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Organizador Local de Fotos y Videos</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <h1>Organizador Local de Fotos</h1>
+        <span id="health-badges" class="badges"></span>
+      </div>
+      <div class="topbar-actions">
+        <button id="btn-settings" type="button" class="btn secondary">Configuración</button>
+        <button id="btn-ai-classify" type="button" class="btn secondary">Clasificar con IA</button>
+        <button id="btn-export" type="button" class="btn primary">Aplicar y Exportar Árbol</button>
+      </div>
+    </header>
+
+    <section class="controls-panel">
+      <div class="path-inputs">
+        <label>
+          Carpeta Origen
+          <input id="source-dir" type="text" placeholder="C:\Users\...\Takeout" />
+        </label>
+        <label>
+          Carpeta Destino
+          <input id="dest-dir" type="text" placeholder="D:\FotosOrganizadas" />
+        </label>
+        <div class="scan-buttons">
+          <button id="btn-start" type="button" class="btn primary">Iniciar Escaneo</button>
+          <button id="btn-pause" type="button" class="btn secondary" disabled>Pausar</button>
+          <button id="btn-resume" type="button" class="btn secondary" disabled>Reanudar</button>
+        </div>
+      </div>
+
+      <div class="progress-wrap">
+        <div class="progress-meta">
+          <span id="progress-stage">Estado: idle</span>
+          <span id="progress-stats">0 / 0 archivos · 0.0 items/s</span>
+        </div>
+        <progress id="progress-bar" max="100" value="0"></progress>
+      </div>
+    </section>
+
+    <main class="workspace">
+      <aside class="tree-pane">
+        <div class="pane-header">
+          <h2>Árbol Propuesto</h2>
+          <div class="folder-actions">
+            <button id="btn-rename-folder" type="button" class="btn small">Renombrar</button>
+            <button id="btn-merge-folder" type="button" class="btn small">Fusionar</button>
+            <button id="btn-create-folder" type="button" class="btn small">Nueva</button>
+          </div>
+        </div>
+        <ul id="folder-list" class="folder-list"></ul>
+      </aside>
+
+      <section class="items-pane">
+        <div class="pane-header">
+          <h2 id="current-folder-title">Elementos</h2>
+          <div class="pagination">
+            <button id="btn-prev-page" type="button" class="btn small">Anterior</button>
+            <span id="page-info">Página 1</span>
+            <button id="btn-next-page" type="button" class="btn small">Siguiente</button>
+          </div>
+        </div>
+        <div id="items-grid" class="items-grid"></div>
+      </section>
+
+      <aside class="preview-pane">
+        <h2>Vista Previa</h2>
+        <div id="preview-box" class="preview-box">
+          <p class="muted">Selecciona un elemento para ver su miniatura y metadatos.</p>
+        </div>
+      </aside>
+    </main>
+
+    <dialog id="settings-modal" class="modal">
+      <form id="settings-form" method="dialog">
+        <h3>Configuración Local</h3>
+        <label>
+          Ruta ExifTool (opcional)
+          <input id="cfg-exiftool" type="text" placeholder="exiftool.exe" />
+        </label>
+        <label>
+          Ruta FFmpeg (opcional)
+          <input id="cfg-ffmpeg" type="text" placeholder="ffmpeg.exe" />
+        </label>
+        <label>
+          Gemini API Key (opcional)
+          <input id="cfg-gemini-key" type="password" placeholder="AIza..." />
+        </label>
+        <label>
+          Modelo Gemini
+          <select id="cfg-gemini-model">
+            <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+            <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+          </select>
+        </label>
+        <div class="modal-actions">
+          <button id="btn-close-settings" type="button" class="btn secondary">Cancelar</button>
+          <button type="submit" class="btn primary">Guardar</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="ai-confirm-modal" class="modal">
+      <div class="modal-body">
+        <h3>Confirmar Clasificación IA</h3>
+        <p id="ai-confirm-text"></p>
+        <div class="modal-actions">
+          <button id="btn-ai-cancel" type="button" class="btn secondary">Cancelar</button>
+          <button id="btn-ai-confirm" type="button" class="btn primary">Confirmar Envío</button>
+        </div>
+      </div>
+    </dialog>
+
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>
