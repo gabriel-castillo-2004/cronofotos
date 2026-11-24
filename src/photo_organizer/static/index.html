@@ -43,6 +43,22 @@
         </div>
       </div>
 
+      <div class="batch-controls">
+        <label class="batch-size-label">
+          Tamaño de lote
+          <select id="batch-size">
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="250">250</option>
+            <option value="500">500</option>
+          </select>
+        </label>
+        <label class="checkbox-label">
+          <input id="solo-primer-lote" type="checkbox" />
+          <span>Probar solo 1 lote</span>
+        </label>
+      </div>
+
       <div class="progress-wrap" role="status" aria-live="polite">
         <div class="progress-meta">
           <span id="progress-stage">Estado: idle</span>
@@ -50,6 +66,15 @@
         </div>
         <progress id="progress-bar" max="100" value="0" aria-label="Progreso del escaneo"></progress>
       </div>
+
+      <details id="batch-panel" class="batch-panel" open>
+        <summary>
+          Progreso por lotes (<span id="batch-summary-count">0 lotes</span>)
+        </summary>
+        <div id="batch-list" class="batch-list">
+          <p class="muted">Los lotes aparecerán aquí al iniciar el escaneo, la clasificación o la exportación.</p>
+        </div>
+      </details>
     </section>
 
     <main class="workspace">
