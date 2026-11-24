@@ -12,13 +12,14 @@ import http.server
 import json
 import mimetypes
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from photo_organizer.ai_classifier import GeminiClassifier, mask_api_key
+from photo_organizer.ai_classifier import DEFAULT_AGY_MODEL, GeminiClassifier
 from photo_organizer.config import OrganizerConfig, validate_source_dest_pair
 from photo_organizer.db import init_db, open_connection, recompute_filenames
 from photo_organizer.exporter import run_two_phase_export
@@ -79,8 +80,8 @@ class _LocalAppCore:
         self.state: dict[str, Any] = {
             "job_task": None,
             "active_job_id": None,
-            "gemini_api_key": "",
-            "gemini_model": cfg.gemini_model,
+            "antigravity_cli": cfg.antigravity_cli or "agy",
+            "model": cfg.gemini_model or DEFAULT_AGY_MODEL,
         }
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
@@ -118,9 +119,10 @@ class _LocalAppCore:
         return {
             "exiftool_path": self.cfg.exiftool_path or "",
             "ffmpeg_path": self.cfg.ffmpeg_path or "",
-            "gemini_api_key": mask_api_key(self.state["gemini_api_key"]),
-            "gemini_model": self.state["gemini_model"],
-            "gemini_configured": bool(self.state["gemini_api_key"]),
+            "antigravity_cli": self.state["antigravity_cli"],
+            "model": self.state["model"],
+            "gemini_model": self.state["model"],
+            "ai_configured": True,
         }
 
     def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -128,18 +130,60 @@ class _LocalAppCore:
             self.cfg.exiftool_path = str(payload["exiftool_path"]).strip() or None
         if payload.get("ffmpeg_path") is not None:
             self.cfg.ffmpeg_path = str(payload["ffmpeg_path"]).strip() or None
-        api_key = payload.get("gemini_api_key")
-        if api_key is not None and not str(api_key).startswith("*"):
-            self.state["gemini_api_key"] = str(api_key).strip()
-        model = str(payload.get("gemini_model") or "").strip()
+        cli_cmd = payload.get("antigravity_cli")
+        if cli_cmd is not None:
+            self.state["antigravity_cli"] = str(cli_cmd).strip() or "agy"
+        model = str(payload.get("model") or payload.get("gemini_model") or "").strip()
         if model:
-            self.state["gemini_model"] = model
+            self.state["model"] = model
 
         self.media_service.close()
         self.media_service = MediaMetadataService(self.cfg.exiftool_path, self.cfg.ffmpeg_path)
         self.thumbs.ffmpeg_bin = self.media_service.ffmpeg_bin
         self.orchestrator.media_service = self.media_service
         return self.get_settings()
+
+    def browse_folder(self, initial_dir: str | None = None) -> dict[str, Any]:
+        """Open a native folder picker dialog on the local Windows/desktop host."""
+        selected = ""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            selected = filedialog.askdirectory(
+                initialdir=initial_dir or None,
+                title="Seleccionar carpeta",
+            ) or ""
+            root.destroy()
+            return {"path": selected, "cancelled": not bool(selected)}
+        except Exception:
+            pass
+
+        if os.name == "nt":
+            try:
+                ps_script = (
+                    "Add-Type -AssemblyName System.Windows.Forms; "
+                    "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                    "$d.Description = 'Seleccionar carpeta'; "
+                    "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+                    "{ Write-Output $d.SelectedPath }"
+                )
+                proc = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_script],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+                selected = (proc.stdout or "").strip()
+                return {"path": selected, "cancelled": not bool(selected)}
+            except Exception as exc:
+                return {"path": "", "cancelled": True, "error": str(exc)}
+
+        return {"path": "", "cancelled": True}
 
     def scan_start(self, payload: dict[str, Any], loop: asyncio.AbstractEventLoop | None = None) -> dict[str, Any]:
         source_dir = str(payload.get("source_dir") or "")
@@ -348,8 +392,8 @@ class _LocalAppCore:
     def ai_classify(self, item_ids: list[str], confirmed: bool) -> dict[str, Any]:
         clf = GeminiClassifier(
             self.cfg.db_path,
-            api_key=self.state["gemini_api_key"],
-            model=self.state["gemini_model"],
+            cli_command=self.state["antigravity_cli"],
+            model=self.state["model"],
         )
         return clf.classify_batch(item_ids, confirmed=confirmed)
 
@@ -402,8 +446,12 @@ if FASTAPI_AVAILABLE:
     class SettingsUpdateRequest(BaseModel):
         exiftool_path: str | None = None
         ffmpeg_path: str | None = None
-        gemini_api_key: str | None = None
-        gemini_model: str = "gemini-2.5-flash"
+        antigravity_cli: str | None = None
+        model: str | None = None
+        gemini_model: str | None = None
+
+    class BrowseFolderRequest(BaseModel):
+        initial_dir: str | None = None
 
     class AIClassifyRequest(BaseModel):
         job_id: str
@@ -449,6 +497,11 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
     @app.post("/api/settings")
     async def update_settings(payload: SettingsUpdateRequest) -> dict[str, Any]:
         return core.update_settings(payload.model_dump())
+
+    @app.post("/api/browse-folder")
+    async def browse_folder(payload: BrowseFolderRequest | None = None) -> dict[str, Any]:
+        initial = payload.initial_dir if payload else None
+        return await asyncio.to_thread(core.browse_folder, initial)
 
     @app.post("/api/scan/start")
     async def scan_start(payload: ScanStartRequest) -> dict[str, Any]:
@@ -654,6 +707,8 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                 body = self._read_json()
                 if path == "/api/settings":
                     self._send_json(200, core.update_settings(body))
+                elif path == "/api/browse-folder":
+                    self._send_json(200, core.browse_folder(body.get("initial_dir")))
                 elif path == "/api/scan/start":
                     self._send_json(200, core.scan_start(body))
                 elif path == "/api/scan/pause":
