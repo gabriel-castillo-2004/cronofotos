@@ -13,13 +13,14 @@
         <span id="health-badges" class="badges"></span>
       </div>
       <div class="topbar-actions">
+        <button id="btn-theme" type="button" class="btn secondary" aria-label="Cambiar tema claro u oscuro">Tema</button>
         <button id="btn-settings" type="button" class="btn secondary">Configuración</button>
         <button id="btn-ai-classify" type="button" class="btn secondary">Clasificar con IA</button>
         <button id="btn-export" type="button" class="btn primary">Aplicar y Exportar Árbol</button>
       </div>
     </header>
 
-    <section class="controls-panel">
+    <section class="controls-panel" aria-label="Controles de escaneo">
       <div class="path-inputs">
         <label>
           Carpeta Origen
@@ -36,17 +37,17 @@
         </div>
       </div>
 
-      <div class="progress-wrap">
+      <div class="progress-wrap" role="status" aria-live="polite">
         <div class="progress-meta">
           <span id="progress-stage">Estado: idle</span>
           <span id="progress-stats">0 / 0 archivos · 0.0 items/s</span>
         </div>
-        <progress id="progress-bar" max="100" value="0"></progress>
+        <progress id="progress-bar" max="100" value="0" aria-label="Progreso del escaneo"></progress>
       </div>
     </section>
 
     <main class="workspace">
-      <aside class="tree-pane">
+      <aside class="tree-pane" role="region" aria-label="Árbol de carpetas propuesto">
         <div class="pane-header">
           <h2>Árbol Propuesto</h2>
           <div class="folder-actions">
@@ -55,22 +56,22 @@
             <button id="btn-create-folder" type="button" class="btn small">Nueva</button>
           </div>
         </div>
-        <ul id="folder-list" class="folder-list"></ul>
+        <ul id="folder-list" class="folder-list" role="tree" aria-label="Carpetas"></ul>
       </aside>
 
-      <section class="items-pane">
+      <section class="items-pane" role="region" aria-label="Elementos de la carpeta">
         <div class="pane-header">
           <h2 id="current-folder-title">Elementos</h2>
           <div class="pagination">
             <button id="btn-prev-page" type="button" class="btn small">Anterior</button>
-            <span id="page-info">Página 1</span>
+            <span id="page-info" aria-live="polite">Página 1</span>
             <button id="btn-next-page" type="button" class="btn small">Siguiente</button>
           </div>
         </div>
-        <div id="items-grid" class="items-grid"></div>
+        <div id="items-grid" class="items-grid" role="list" aria-label="Miniaturas de elementos"></div>
       </section>
 
-      <aside class="preview-pane">
+      <aside class="preview-pane" role="region" aria-label="Vista previa y metadatos" aria-live="polite">
         <h2>Vista Previa</h2>
         <div id="preview-box" class="preview-box">
           <p class="muted">Selecciona un elemento para ver su miniatura y metadatos.</p>
