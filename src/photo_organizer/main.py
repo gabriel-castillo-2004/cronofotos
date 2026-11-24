@@ -190,6 +190,8 @@ class _LocalAppCore:
         dest_dir = str(payload.get("dest_dir") or "")
         time_gap_hours = float(payload.get("time_gap_hours", 4.0))
         gps_distance_km = float(payload.get("gps_distance_km", 25.0))
+        batch_size = int(payload.get("batch_size") or 100)
+        solo_primer_lote = bool(payload.get("solo_primer_lote", False))
         if time_gap_hours <= 0 or gps_distance_km <= 0:
             raise _ApiError(400, "time_gap_hours and gps_distance_km must be positive.")
         try:
@@ -203,6 +205,8 @@ class _LocalAppCore:
                 dst,
                 time_gap_hours=time_gap_hours,
                 gps_distance_km=gps_distance_km,
+                batch_size=batch_size,
+                solo_primer_lote=solo_primer_lote,
             )
             self.state["active_job_id"] = jid
 
@@ -389,15 +393,31 @@ class _LocalAppCore:
             raise _ApiError(404, "Item not found")
         return self.thumbs.get_or_create(row["id"], Path(row["source_path"]), row["sha256"])
 
-    def ai_classify(self, item_ids: list[str], confirmed: bool) -> dict[str, Any]:
+    def ai_classify(
+        self,
+        item_ids: list[str],
+        confirmed: bool,
+        batch_size: int = 100,
+        solo_primer_lote: bool = False,
+    ) -> dict[str, Any]:
         clf = GeminiClassifier(
             self.cfg.db_path,
             cli_command=self.state["antigravity_cli"],
             model=self.state["model"],
         )
-        return clf.classify_batch(item_ids, confirmed=confirmed)
+        return clf.classify_batch(
+            item_ids,
+            confirmed=confirmed,
+            batch_size=int(batch_size or 100),
+            solo_primer_lote=bool(solo_primer_lote),
+        )
 
-    def export_tree(self, job_id: str) -> dict[str, Any]:
+    def export_tree(
+        self,
+        job_id: str,
+        batch_size: int = 100,
+        solo_primer_lote: bool = False,
+    ) -> dict[str, Any]:
         conn = open_connection(self.cfg.db_path)
         try:
             job = conn.execute(
@@ -413,6 +433,8 @@ class _LocalAppCore:
             job_id,
             Path(job["dest_dir"]),
             self.media_service,
+            batch_size=int(batch_size or 100),
+            solo_primer_lote=bool(solo_primer_lote),
         )
 
 
@@ -423,6 +445,8 @@ if FASTAPI_AVAILABLE:
         dest_dir: str
         time_gap_hours: float = Field(default=4.0, gt=0.0)
         gps_distance_km: float = Field(default=25.0, gt=0.0)
+        batch_size: int = Field(default=100, ge=1)
+        solo_primer_lote: bool = False
 
     class FolderRenameRequest(BaseModel):
         job_id: str
@@ -457,9 +481,13 @@ if FASTAPI_AVAILABLE:
         job_id: str
         item_ids: list[str]
         confirmed: bool = False
+        batch_size: int = Field(default=100, ge=1)
+        solo_primer_lote: bool = False
 
     class ExportRequest(BaseModel):
         job_id: str
+        batch_size: int = Field(default=100, ge=1)
+        solo_primer_lote: bool = False
 
 
 def create_app(config: OrganizerConfig | None = None) -> Any:
@@ -589,12 +617,22 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
 
     @app.post("/api/ai/classify")
     async def ai_classify(payload: AIClassifyRequest) -> dict[str, Any]:
-        return core.ai_classify(payload.item_ids, payload.confirmed)
+        return core.ai_classify(
+            payload.item_ids,
+            payload.confirmed,
+            batch_size=payload.batch_size,
+            solo_primer_lote=payload.solo_primer_lote,
+        )
 
     @app.post("/api/export")
     async def export_tree(payload: ExportRequest) -> dict[str, Any]:
         try:
-            return await asyncio.to_thread(core.export_tree, payload.job_id)
+            return await asyncio.to_thread(
+                core.export_tree,
+                payload.job_id,
+                payload.batch_size,
+                payload.solo_primer_lote,
+            )
         except _ApiError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
@@ -735,10 +773,22 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                 elif path == "/api/ai/classify":
                     self._send_json(
                         200,
-                        core.ai_classify(body.get("item_ids", []), bool(body.get("confirmed", False))),
+                        core.ai_classify(
+                            body.get("item_ids", []),
+                            bool(body.get("confirmed", False)),
+                            batch_size=int(body.get("batch_size") or 100),
+                            solo_primer_lote=bool(body.get("solo_primer_lote", False)),
+                        ),
                     )
                 elif path == "/api/export":
-                    self._send_json(200, core.export_tree(body["job_id"]))
+                    self._send_json(
+                        200,
+                        core.export_tree(
+                            body["job_id"],
+                            batch_size=int(body.get("batch_size") or 100),
+                            solo_primer_lote=bool(body.get("solo_primer_lote", False)),
+                        ),
+                    )
                 else:
                     self._send_json(404, {"detail": "Not found"})
             except _ApiError as exc:

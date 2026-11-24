@@ -202,20 +202,82 @@ class GeminiClassifier:
         *,
         confirmed: bool = False,
         kind: str = "item",
+        batch_size: int = 100,
+        solo_primer_lote: bool = False,
     ) -> dict[str, Any]:
         """Require explicit user confirmation before dispatching a remote AI batch."""
+        eff_batch_size = batch_size if batch_size and batch_size > 0 else 100
+        chunks = [keys[i : i + eff_batch_size] for i in range(0, len(keys), eff_batch_size)]
+        total_batches = len(chunks)
+
         if not confirmed:
             return {
                 "requires_confirmation": True,
                 "item_count": len(keys),
+                "batch_size": eff_batch_size,
+                "total_batches": total_batches,
+                "solo_primer_lote": solo_primer_lote,
                 "model": self.model,
                 "results": {},
             }
-        results = {k: self.classify(k, kind=kind) for k in keys}
+
+        batches: list[dict[str, Any]] = [
+            {
+                "batch_index": idx + 1,
+                "total_batches": total_batches,
+                "label": f"Lote {idx + 1} de {total_batches}",
+                "status": "pendiente",
+                "total_items": len(chunk),
+                "processed_items": 0,
+                "duplicates_skipped": 0,
+                "errors": 0,
+                "elapsed_seconds": 0.0,
+                "error_message": None,
+            }
+            for idx, chunk in enumerate(chunks)
+        ]
+
+        results: dict[str, str] = {}
+        for b_idx, chunk in enumerate(chunks):
+            batch_info = batches[b_idx]
+            cached_chunk: dict[str, str] = {}
+            for k in chunk:
+                cached = self._get_cached(k)
+                if cached is not None:
+                    cached_chunk[k] = cached
+
+            if len(cached_chunk) == len(chunk):
+                results.update(cached_chunk)
+                batch_info["status"] = "completado"
+                batch_info["processed_items"] = len(chunk)
+                batch_info["elapsed_seconds"] = 0.0
+                continue
+
+            batch_info["status"] = "en_proceso"
+            t0 = time.monotonic()
+            errors = 0
+            for k in chunk:
+                try:
+                    results[k] = self.classify(k, kind=kind)
+                    batch_info["processed_items"] += 1
+                except Exception as exc:  # pragma: no cover
+                    errors += 1
+                    batch_info["errors"] = errors
+                    batch_info["error_message"] = str(exc)
+
+            batch_info["elapsed_seconds"] = round(time.monotonic() - t0, 3)
+            batch_info["status"] = "error" if errors > 0 and batch_info["processed_items"] == 0 else "completado"
+
+            if solo_primer_lote and b_idx == 0 and total_batches > 1:
+                break
+
         return {
             "requires_confirmation": False,
             "item_count": len(keys),
+            "batch_size": eff_batch_size,
+            "solo_primer_lote": solo_primer_lote,
             "model": self.model,
             "circuit_open": self.circuit_open,
+            "batches": batches,
             "results": results,
         }

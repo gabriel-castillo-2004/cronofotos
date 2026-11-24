@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from photo_organizer.config import IGNORED_SIDECAR_EXTENSIONS, to_win_long_path
 from photo_organizer.db import open_connection
@@ -36,16 +38,22 @@ def run_two_phase_export(
     media_service: MediaMetadataService,
     *,
     crash_after: int | None = None,
-) -> dict[str, int]:
-    """Export staged media_items: PENDING_EXPORT -> COPIED -> METADATA_EMBEDDED -> VERIFIED."""
+    batch_size: int = 100,
+    solo_primer_lote: bool = False,
+    pause_event: threading.Event | None = None,
+    on_batch_progress: Callable[[list[dict[str, Any]]], None] | None = None,
+) -> dict[str, Any]:
+    """Export staged media_items sequentially in batches without mutating source files."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     cleaned = cleanup_orphaned_tmp_files(dest_dir)
 
+    eff_batch_size = batch_size if batch_size and batch_size > 0 else 100
     conn = open_connection(db_path)
     exported = 0
     duplicates = 0
     skipped = 0
     failed = 0
+    batches_info: list[dict[str, Any]] = []
 
     try:
         rows = conn.execute(
@@ -59,81 +67,149 @@ def run_two_phase_export(
             (job_id,),
         ).fetchall()
 
-        for idx, row in enumerate(rows):
-            if row["export_state"] == "VERIFIED":
-                skipped += 1
-                continue
-            if row["is_placeholder"]:
-                skipped += 1
-                continue
-            if str(row["ext"]).lower() in IGNORED_SIDECAR_EXTENSIONS:
-                skipped += 1
+        chunks = [rows[i : i + eff_batch_size] for i in range(0, len(rows), eff_batch_size)]
+        total_batches = len(chunks)
+        batches_info = [
+            {
+                "batch_index": idx + 1,
+                "total_batches": total_batches,
+                "label": f"Lote {idx + 1} de {total_batches}",
+                "status": "pendiente",
+                "total_items": len(chunk),
+                "processed_items": 0,
+                "duplicates_skipped": 0,
+                "errors": 0,
+                "elapsed_seconds": 0.0,
+                "error_message": None,
+            }
+            for idx, chunk in enumerate(chunks)
+        ]
+
+        global_idx = -1
+        for b_idx, chunk in enumerate(chunks):
+            batch_info = batches_info[b_idx]
+
+            # Skip already completed batches when resuming/continuing
+            if all(
+                r["export_state"] == "VERIFIED"
+                or r["is_placeholder"]
+                or str(r["ext"]).lower() in IGNORED_SIDECAR_EXTENSIONS
+                for r in chunk
+            ):
+                global_idx += len(chunk)
+                batch_info["status"] = "completado"
+                batch_info["processed_items"] = len(chunk)
+                skipped += len(chunk)
                 continue
 
-            src = Path(row["source_path"])
-            if not src.is_file():
+            batch_info["status"] = "en_proceso"
+            if on_batch_progress:
+                on_batch_progress(batches_info)
+            t0 = time.monotonic()
+            batch_exported = 0
+            batch_errors = 0
+
+            for row in chunk:
+                global_idx += 1
+                if pause_event is not None:
+                    pause_event.wait()
+
+                if row["export_state"] == "VERIFIED":
+                    skipped += 1
+                    batch_info["processed_items"] += 1
+                    continue
+                if row["is_placeholder"]:
+                    skipped += 1
+                    batch_info["processed_items"] += 1
+                    continue
+                if str(row["ext"]).lower() in IGNORED_SIDECAR_EXTENSIONS:
+                    skipped += 1
+                    batch_info["processed_items"] += 1
+                    continue
+
+                src = Path(row["source_path"])
+                if not src.is_file():
+                    conn.execute(
+                        "UPDATE media_items SET export_state = 'FAILED' WHERE id = ?",
+                        (row["id"],),
+                    )
+                    conn.commit()
+                    failed += 1
+                    batch_errors += 1
+                    batch_info["errors"] = batch_errors
+                    batch_info["error_message"] = f"Archivo origen no encontrado: {src}"
+                    batch_info["processed_items"] += 1
+                    continue
+
+                target_dir = dest_dir / row["target_folder"]
+                target_dir.mkdir(parents=True, exist_ok=True)
+                final_path = target_dir / row["target_filename"]
+                tmp_path = target_dir / f"{row['target_filename']}.tmp"
+
+                shutil.copy2(to_win_long_path(src), to_win_long_path(tmp_path))
+
+                # Verify copied bytes against source SHA-256
+                expected_sha = row["sha256"] or compute_sha256_streaming(src)
+                actual_sha = compute_sha256_streaming(tmp_path)
+                if actual_sha != expected_sha:
+                    tmp_path.unlink(missing_ok=True)
+                    conn.execute(
+                        "UPDATE media_items SET export_state = 'FAILED' WHERE id = ?",
+                        (row["id"],),
+                    )
+                    conn.commit()
+                    failed += 1
+                    batch_errors += 1
+                    batch_info["errors"] = batch_errors
+                    batch_info["error_message"] = f"SHA-256 no coincide para {src.name}"
+                    batch_info["processed_items"] += 1
+                    continue
+
                 conn.execute(
-                    "UPDATE media_items SET export_state = 'FAILED' WHERE id = ?",
+                    "UPDATE media_items SET export_state = 'COPIED' WHERE id = ?",
                     (row["id"],),
                 )
                 conn.commit()
-                failed += 1
-                continue
 
-            target_dir = dest_dir / row["target_folder"]
-            target_dir.mkdir(parents=True, exist_ok=True)
-            final_path = target_dir / row["target_filename"]
-            tmp_path = target_dir / f"{row['target_filename']}.tmp"
+                # Embed metadata on destination .tmp copy only (source untouched)
+                meta: dict[str, Any] = {}
+                if row["metadata_json"]:
+                    try:
+                        meta = json.loads(row["metadata_json"])
+                    except json.JSONDecodeError:
+                        meta = {}
+                media_service.embed_metadata(tmp_path, meta)
 
-            shutil.copy2(to_win_long_path(src), to_win_long_path(tmp_path))
-
-            # Verify copied bytes against source SHA-256
-            expected_sha = row["sha256"] or compute_sha256_streaming(src)
-            actual_sha = compute_sha256_streaming(tmp_path)
-            if actual_sha != expected_sha:
-                tmp_path.unlink(missing_ok=True)
                 conn.execute(
-                    "UPDATE media_items SET export_state = 'FAILED' WHERE id = ?",
+                    "UPDATE media_items SET export_state = 'METADATA_EMBEDDED' WHERE id = ?",
                     (row["id"],),
                 )
                 conn.commit()
-                failed += 1
-                continue
 
-            conn.execute(
-                "UPDATE media_items SET export_state = 'COPIED' WHERE id = ?",
-                (row["id"],),
-            )
-            conn.commit()
+                if crash_after is not None and global_idx == crash_after:
+                    raise RuntimeError("Simulated mid-export crash")
 
-            # Embed metadata on destination .tmp copy only (source untouched)
-            meta: dict[str, Any] = {}
-            if row["metadata_json"]:
-                try:
-                    meta = json.loads(row["metadata_json"])
-                except json.JSONDecodeError:
-                    meta = {}
-            media_service.embed_metadata(tmp_path, meta)
+                os.replace(to_win_long_path(tmp_path), to_win_long_path(final_path))
+                conn.execute(
+                    "UPDATE media_items SET export_state = 'VERIFIED' WHERE id = ?",
+                    (row["id"],),
+                )
+                conn.commit()
 
-            conn.execute(
-                "UPDATE media_items SET export_state = 'METADATA_EMBEDDED' WHERE id = ?",
-                (row["id"],),
-            )
-            conn.commit()
+                exported += 1
+                batch_exported += 1
+                batch_info["processed_items"] += 1
+                if row["is_duplicate"]:
+                    duplicates += 1
+                    batch_info["duplicates_skipped"] += 1
 
-            if crash_after is not None and idx == crash_after:
-                raise RuntimeError("Simulated mid-export crash")
+            batch_info["elapsed_seconds"] = round(time.monotonic() - t0, 3)
+            batch_info["status"] = "error" if (batch_errors > 0 and batch_exported == 0) else "completado"
+            if on_batch_progress:
+                on_batch_progress(batches_info)
 
-            os.replace(to_win_long_path(tmp_path), to_win_long_path(final_path))
-            conn.execute(
-                "UPDATE media_items SET export_state = 'VERIFIED' WHERE id = ?",
-                (row["id"],),
-            )
-            conn.commit()
-
-            exported += 1
-            if row["is_duplicate"]:
-                duplicates += 1
+            if solo_primer_lote and b_idx == 0 and total_batches > 1:
+                break
     finally:
         conn.close()
 
@@ -143,4 +219,7 @@ def run_two_phase_export(
         "skipped": skipped,
         "failed": failed,
         "cleaned_tmp": cleaned,
+        "batch_size": eff_batch_size,
+        "solo_primer_lote": solo_primer_lote,
+        "batches": batches_info,
     }

@@ -38,6 +38,88 @@ async function refreshHealth() {
   container.appendChild(makeBadge("FFmpeg", health.ffmpeg_available));
 }
 
+function getBatchOptions() {
+  const sizeEl = $("batch-size");
+  const soloEl = $("solo-primer-lote");
+  return {
+    batch_size: sizeEl ? Number(sizeEl.value || 100) : 100,
+    solo_primer_lote: soloEl ? Boolean(soloEl.checked) : false,
+  };
+}
+
+function renderBatches(batches) {
+  const listEl = $("batch-list");
+  const countEl = $("batch-summary-count");
+  if (!listEl || !countEl) return;
+
+  const items = Array.isArray(batches) ? batches : [];
+  countEl.textContent = `${items.length} ${items.length === 1 ? "lote" : "lotes"}`;
+  listEl.innerHTML = "";
+
+  if (items.length === 0) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = "Los lotes aparecerán aquí al iniciar el escaneo, la clasificación o la exportación.";
+    listEl.appendChild(p);
+    return;
+  }
+
+  const stateLabels = {
+    pendiente: "pendiente",
+    en_proceso: "en_proceso",
+    completado: "completado",
+    error: "error",
+  };
+
+  items.forEach((b, idx) => {
+    const totalBatches = b.total_batches || items.length;
+    const batchNum = b.batch_index || idx + 1;
+    const status = stateLabels[b.status] || b.status || "pendiente";
+    const total = Number(b.total_items || 0);
+    const processed = Number(b.processed_items || 0);
+    const dups = Number(b.duplicates_skipped || 0);
+    const errors = Number(b.errors || 0);
+    const elapsed = Number(b.elapsed_seconds || 0).toFixed(2);
+
+    const card = document.createElement("div");
+    card.className = `batch-card batch-status-${status}`;
+
+    const header = document.createElement("div");
+    header.className = "batch-card-header";
+
+    const title = document.createElement("strong");
+    title.textContent = `Lote ${batchNum} de ${totalBatches}`;
+
+    const badge = document.createElement("span");
+    badge.className = `badge batch-badge ${status}`;
+    badge.textContent = status;
+
+    header.appendChild(title);
+    header.appendChild(badge);
+
+    const prog = document.createElement("progress");
+    prog.max = total > 0 ? total : 1;
+    prog.value = processed;
+
+    const meta = document.createElement("div");
+    meta.className = "batch-card-meta";
+    meta.textContent = `${processed} / ${total} elementos · ${dups} dup · ${elapsed}s${errors > 0 ? ` · ${errors} errores` : ""}`;
+
+    card.appendChild(header);
+    card.appendChild(prog);
+    card.appendChild(meta);
+
+    if (b.error_message) {
+      const errEl = document.createElement("div");
+      errEl.className = "batch-card-error";
+      errEl.textContent = b.error_message;
+      card.appendChild(errEl);
+    }
+
+    listEl.appendChild(card);
+  });
+}
+
 function updateProgressUI(snap) {
   if (snap.job_id) state.jobId = snap.job_id;
   $("progress-stage").textContent = `Estado: ${snap.status} (${snap.stage})`;
@@ -49,7 +131,11 @@ function updateProgressUI(snap) {
   $("btn-pause").disabled = snap.status !== "scanning";
   $("btn-resume").disabled = snap.status !== "paused";
 
-  if (snap.status === "completed") {
+  if (Array.isArray(snap.batches) && snap.batches.length > 0) {
+    renderBatches(snap.batches);
+  }
+
+  if (snap.status === "completed" || snap.status === "partial") {
     loadTree();
   }
 }
@@ -225,7 +311,13 @@ function bindEvents() {
     const source_dir = $("source-dir").value.trim();
     const dest_dir = $("dest-dir").value.trim();
     if (!source_dir || !dest_dir) return alert("Indica carpeta origen y destino.");
-    const snap = await api("/api/scan/start", "POST", { source_dir, dest_dir });
+    const { batch_size, solo_primer_lote } = getBatchOptions();
+    const snap = await api("/api/scan/start", "POST", {
+      source_dir,
+      dest_dir,
+      batch_size,
+      solo_primer_lote,
+    });
     updateProgressUI(snap);
     connectSSE();
   };
@@ -306,32 +398,49 @@ function bindEvents() {
   $("btn-ai-classify").onclick = async () => {
     if (!state.jobId || state.items.length === 0) return;
     const ids = state.items.map((it) => it.id);
+    const { batch_size, solo_primer_lote } = getBatchOptions();
     const preview = await api("/api/ai/classify", "POST", {
       job_id: state.jobId,
       item_ids: ids,
       confirmed: false,
+      batch_size,
+      solo_primer_lote,
     });
     $("ai-confirm-text").textContent =
-      `Se enviarán ${preview.item_count} elementos al modelo ${preview.model}. ¿Continuar?`;
+      `Se enviarán ${preview.item_count} elementos en lotes de ${batch_size} al modelo ${preview.model}. ¿Continuar?`;
     $("ai-confirm-modal").showModal();
   };
 
   $("btn-ai-cancel").onclick = () => $("ai-confirm-modal").close();
   $("btn-ai-confirm").onclick = async () => {
     const ids = state.items.map((it) => it.id);
-    await api("/api/ai/classify", "POST", {
+    const { batch_size, solo_primer_lote } = getBatchOptions();
+    const res = await api("/api/ai/classify", "POST", {
       job_id: state.jobId,
       item_ids: ids,
       confirmed: true,
+      batch_size,
+      solo_primer_lote,
     });
     $("ai-confirm-modal").close();
+    if (Array.isArray(res.batches)) {
+      renderBatches(res.batches);
+    }
     await loadTree();
   };
 
   $("btn-export").onclick = async () => {
     if (!state.jobId) return alert("Primero ejecuta un escaneo.");
     if (!confirm("¿Aplicar y Exportar Árbol al directorio destino?")) return;
-    const res = await api("/api/export", "POST", { job_id: state.jobId });
+    const { batch_size, solo_primer_lote } = getBatchOptions();
+    const res = await api("/api/export", "POST", {
+      job_id: state.jobId,
+      batch_size,
+      solo_primer_lote,
+    });
+    if (Array.isArray(res.batches)) {
+      renderBatches(res.batches);
+    }
     alert(`Exportación completa: ${res.exported} exportados, ${res.duplicates} duplicados, ${res.skipped} omitidos.`);
     await loadTree();
   };
