@@ -84,12 +84,23 @@ async function loadTree() {
   folderList.innerHTML = "";
   for (const f of data.folders || []) {
     const li = document.createElement("li");
-    li.className = `folder-item ${state.selectedFolder === f.folder ? "active" : ""}`;
+    const isActive = state.selectedFolder === f.folder;
+    li.className = `folder-item ${isActive ? "active" : ""}`;
+    li.setAttribute("role", "treeitem");
+    li.setAttribute("aria-selected", isActive ? "true" : "false");
+    li.tabIndex = 0;
     li.textContent = `${f.folder} (${f.count})`;
-    li.onclick = () => {
+    const selectFolder = () => {
       state.selectedFolder = f.folder;
       state.page = 1;
       loadTree();
+    };
+    li.onclick = selectFolder;
+    li.onkeydown = (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        selectFolder();
+      }
     };
     folderList.appendChild(li);
   }
@@ -102,31 +113,81 @@ async function loadTree() {
   for (const item of state.items) {
     const card = document.createElement("div");
     card.className = "item-card";
-    card.innerHTML = `
-      <img src="/api/thumbnails/${encodeURIComponent(item.id)}" loading="lazy" alt="" />
-      <div class="item-name">${item.target_filename}</div>
-      <div class="item-sub">${item.target_folder}</div>
-    `;
+    card.setAttribute("role", "listitem");
+    card.tabIndex = 0;
+
+    const img = document.createElement("img");
+    img.src = `/api/thumbnails/${encodeURIComponent(item.id)}`;
+    img.loading = "lazy";
+    img.alt = item.target_filename || "";
+
+    const nameEl = document.createElement("div");
+    nameEl.className = "item-name";
+    nameEl.textContent = item.target_filename || "";
+
+    const subEl = document.createElement("div");
+    subEl.className = "item-sub";
+    subEl.textContent = item.target_folder || "";
+
+    card.appendChild(img);
+    card.appendChild(nameEl);
+    card.appendChild(subEl);
     card.onclick = () => showPreview(item);
+    card.onkeydown = (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        showPreview(item);
+      }
+    };
     grid.appendChild(card);
   }
 }
 
 function showPreview(item) {
   const box = $("preview-box");
-  box.innerHTML = `
-    <img class="preview-img" src="/api/thumbnails/${encodeURIComponent(item.id)}" alt="" />
-    <dl class="meta-list">
-      <dt>Archivo destino</dt><dd>${item.target_filename}</dd>
-      <dt>Carpeta</dt><dd>${item.target_folder}</dd>
-      <dt>Fecha</dt><dd>${item.captured_at || "Sin fecha"}</dd>
-      <dt>Ubicación</dt><dd>${item.location_label || "N/A"}</dd>
-      <dt>Estado</dt><dd>${item.export_state}</dd>
-    </dl>
-  `;
+  box.innerHTML = "";
+
+  const img = document.createElement("img");
+  img.className = "preview-img";
+  img.src = `/api/thumbnails/${encodeURIComponent(item.id)}`;
+  img.alt = item.target_filename || "Vista previa";
+
+  const dl = document.createElement("dl");
+  dl.className = "meta-list";
+  const fields = [
+    ["Archivo destino", item.target_filename || ""],
+    ["Carpeta", item.target_folder || ""],
+    ["Fecha", item.captured_at || "Sin fecha"],
+    ["Ubicación", item.location_label || "N/A"],
+    ["Estado", item.export_state || ""],
+  ];
+  for (const [label, value] of fields) {
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    dl.appendChild(dt);
+    dl.appendChild(dd);
+  }
+
+  box.appendChild(img);
+  box.appendChild(dl);
 }
 
 function bindEvents() {
+  const themeBtn = $("btn-theme");
+  if (themeBtn) {
+    themeBtn.onclick = () => {
+      const root = document.documentElement;
+      const isLight = root.getAttribute("data-theme") === "light";
+      if (isLight) {
+        root.removeAttribute("data-theme");
+      } else {
+        root.setAttribute("data-theme", "light");
+      }
+    };
+  }
+
   $("btn-start").onclick = async () => {
     const source_dir = $("source-dir").value.trim();
     const dest_dir = $("dest-dir").value.trim();

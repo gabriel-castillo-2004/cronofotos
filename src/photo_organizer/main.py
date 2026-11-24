@@ -206,7 +206,17 @@ class _LocalAppCore:
                 """,
                 (jid,),
             ).fetchall()
-            folders = [dict(r) for r in folder_rows]
+            folder_counts: dict[str, int] = {str(r["folder"]): int(r["count"]) for r in folder_rows}
+            custom_rows = conn.execute(
+                "SELECT folder FROM custom_folders WHERE job_id = ?",
+                (jid,),
+            ).fetchall()
+            for cr in custom_rows:
+                folder_counts.setdefault(str(cr["folder"]), 0)
+            folders = [
+                {"folder": name, "count": folder_counts[name]}
+                for name in sorted(folder_counts.keys())
+            ]
 
             if folder:
                 count_row = conn.execute(
@@ -261,6 +271,14 @@ class _LocalAppCore:
                     "UPDATE media_items SET target_folder = ? WHERE job_id = ? AND target_folder = ?",
                     (new_folder, job_id, old_folder),
                 )
+                conn.execute(
+                    "UPDATE OR IGNORE custom_folders SET folder = ? WHERE job_id = ? AND folder = ?",
+                    (new_folder, job_id, old_folder),
+                )
+                conn.execute(
+                    "DELETE FROM custom_folders WHERE job_id = ? AND folder = ?",
+                    (job_id, old_folder),
+                )
                 count = recompute_filenames(conn, job_id, new_folder)
             return {"folder": new_folder, "updated": count}
         finally:
@@ -274,8 +292,30 @@ class _LocalAppCore:
                     "UPDATE media_items SET target_folder = ? WHERE job_id = ? AND target_folder = ?",
                     (to_folder, job_id, from_folder),
                 )
+                conn.execute(
+                    "DELETE FROM custom_folders WHERE job_id = ? AND folder = ?",
+                    (job_id, from_folder),
+                )
                 count = recompute_filenames(conn, job_id, to_folder)
             return {"merged": from_folder, "into": to_folder, "updated": count}
+        finally:
+            conn.close()
+
+    def create_folder(self, job_id: str, folder: str) -> dict[str, Any]:
+        clean = folder.strip().strip("/\\")
+        if not clean or ".." in Path(clean).parts:
+            raise _ApiError(400, "Invalid folder name")
+        conn = open_connection(self.cfg.db_path)
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO custom_folders (job_id, folder, created_at)
+                    VALUES (?, ?, datetime('now'))
+                    """,
+                    (job_id, clean),
+                )
+            return {"folder": clean, "created": True}
         finally:
             conn.close()
 
@@ -472,7 +512,10 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
 
     @app.post("/api/tree/folders/create")
     async def create_folder(payload: FolderCreateRequest) -> dict[str, Any]:
-        return {"folder": payload.folder, "created": True}
+        try:
+            return await asyncio.to_thread(core.create_folder, payload.job_id, payload.folder)
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
     @app.post("/api/tree/items/move")
     async def move_item(payload: ItemMoveRequest) -> dict[str, Any]:
@@ -628,7 +671,7 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                         core.merge_folders(body["job_id"], body["from_folder"], body["to_folder"]),
                     )
                 elif path == "/api/tree/folders/create":
-                    self._send_json(200, {"folder": body["folder"], "created": True})
+                    self._send_json(200, core.create_folder(body["job_id"], body["folder"]))
                 elif path == "/api/tree/items/move":
                     self._send_json(
                         200,

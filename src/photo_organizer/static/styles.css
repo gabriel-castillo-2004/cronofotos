@@ -1,12 +1,29 @@
 :root {
   --bg: #0f172a;
+  --surface: #162032;
   --panel: #1e293b;
   --border: #334155;
   --text: #f8fafc;
   --muted: #94a3b8;
   --accent: #38bdf8;
+  --accent-contrast: #0f172a;
   --ok: #22c55e;
   --warn: #f59e0b;
+  --focus-ring: #fde047;
+}
+
+:root[data-theme="light"] {
+  --bg: #f8fafc;
+  --surface: #f1f5f9;
+  --panel: #ffffff;
+  --border: #cbd5e1;
+  --text: #0f172a;
+  --muted: #475569;
+  --accent: #0284c7;
+  --accent-contrast: #ffffff;
+  --ok: #15803d;
+  --warn: #b45309;
+  --focus-ring: #0369a1;
 }
 
 * {
@@ -75,7 +92,7 @@ body {
 
 .btn {
   border: 1px solid var(--border);
-  background: #0f172a;
+  background: var(--bg);
   color: var(--text);
   padding: 0.45rem 0.85rem;
   border-radius: 6px;
@@ -85,7 +102,7 @@ body {
 
 .btn.primary {
   background: var(--accent);
-  color: #0f172a;
+  color: var(--accent-contrast);
   border-color: var(--accent);
   font-weight: 600;
 }
@@ -100,9 +117,18 @@ body {
   cursor: not-allowed;
 }
 
+.btn:focus-visible,
+input:focus-visible,
+select:focus-visible,
+.folder-item:focus-visible,
+.item-card:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
 .controls-panel {
   padding: 0.9rem 1.25rem;
-  background: #162032;
+  background: var(--surface);
   border-bottom: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -126,7 +152,7 @@ label {
 
 input,
 select {
-  background: #0f172a;
+  background: var(--bg);
   border: 1px solid var(--border);
   color: var(--text);
   padding: 0.45rem 0.6rem;
@@ -283,4 +309,62 @@ progress {
 .muted {
   color: var(--muted);
   font-size: 0.85rem;
+}
+
+@media (max-width: 1024px) {
+  .workspace {
+    grid-template-columns: 220px 1fr 240px;
+  }
+}
+
+@media (max-width: 768px) {
+  .topbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.75rem;
+  }
+
+  .topbar-actions {
+    flex-wrap: wrap;
+  }
+
+  .path-inputs {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    align-items: stretch;
+  }
+
+  .scan-buttons {
+    flex-wrap: wrap;
+  }
+
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .tree-pane,
+  .items-pane,
+  .preview-pane {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+@media (max-width: 480px) {
+  .controls-panel,
+  .topbar {
+    padding: 0.75rem;
+  }
+
+  .pane-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+
+  .modal {
+    min-width: 0;
+    width: calc(100vw - 2rem);
+  }
 }

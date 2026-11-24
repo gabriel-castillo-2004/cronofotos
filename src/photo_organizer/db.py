@@ -76,6 +76,14 @@ CREATE TABLE IF NOT EXISTS ai_cache (
     model TEXT NOT NULL DEFAULT 'gemini-2.5-flash',
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS custom_folders (
+    job_id TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, folder),
+    FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
 """
 
 
