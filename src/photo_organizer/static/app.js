@@ -110,6 +110,22 @@ async function loadTree() {
 
   const grid = $("items-grid");
   grid.innerHTML = "";
+  if (state.items.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    const h3 = document.createElement("h3");
+    h3.textContent = state.jobId
+      ? "Esta carpeta está vacía"
+      : "Aún no hay elementos escaneados";
+    const p = document.createElement("p");
+    p.textContent = state.jobId
+      ? "Selecciona otra carpeta en el árbol izquierdo para ver sus elementos."
+      : "Selecciona la Carpeta Origen y la Carpeta Destino arriba, y pulsa Iniciar Escaneo para previsualizar el árbol propuesto.";
+    empty.appendChild(h3);
+    empty.appendChild(p);
+    grid.appendChild(empty);
+    return;
+  }
   for (const item of state.items) {
     const card = document.createElement("div");
     card.className = "item-card";
@@ -188,6 +204,23 @@ function bindEvents() {
     };
   }
 
+  const browseFolder = async (inputId) => {
+    const input = $(inputId);
+    const res = await api("/api/browse-folder", "POST", {
+      initial_dir: input.value.trim() || null,
+    });
+    if (res.path) {
+      input.value = res.path;
+    }
+  };
+
+  if ($("btn-browse-source")) {
+    $("btn-browse-source").onclick = () => browseFolder("source-dir");
+  }
+  if ($("btn-browse-dest")) {
+    $("btn-browse-dest").onclick = () => browseFolder("dest-dir");
+  }
+
   $("btn-start").onclick = async () => {
     const source_dir = $("source-dir").value.trim();
     const dest_dir = $("dest-dir").value.trim();
@@ -251,8 +284,8 @@ function bindEvents() {
     const cfg = await api("/api/settings");
     $("cfg-exiftool").value = cfg.exiftool_path || "";
     $("cfg-ffmpeg").value = cfg.ffmpeg_path || "";
-    $("cfg-gemini-key").value = cfg.gemini_api_key || "";
-    $("cfg-gemini-model").value = cfg.gemini_model || "gemini-2.5-flash";
+    $("cfg-antigravity-cli").value = cfg.antigravity_cli || "agy";
+    $("cfg-antigravity-model").value = cfg.model || "gemini-4-hydrogen-medium";
     $("settings-modal").showModal();
   };
 
@@ -263,8 +296,8 @@ function bindEvents() {
     await api("/api/settings", "POST", {
       exiftool_path: $("cfg-exiftool").value,
       ffmpeg_path: $("cfg-ffmpeg").value,
-      gemini_api_key: $("cfg-gemini-key").value,
-      gemini_model: $("cfg-gemini-model").value,
+      antigravity_cli: $("cfg-antigravity-cli").value,
+      model: $("cfg-antigravity-model").value,
     });
     $("settings-modal").close();
     await refreshHealth();

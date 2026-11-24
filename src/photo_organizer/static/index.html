@@ -24,11 +24,17 @@
       <div class="path-inputs">
         <label>
           Carpeta Origen
-          <input id="source-dir" type="text" placeholder="C:\Users\...\Takeout" />
+          <div class="input-with-btn">
+            <input id="source-dir" type="text" placeholder="C:\Users\...\Takeout" />
+            <button id="btn-browse-source" type="button" class="btn secondary">Examinar...</button>
+          </div>
         </label>
         <label>
           Carpeta Destino
-          <input id="dest-dir" type="text" placeholder="D:\FotosOrganizadas" />
+          <div class="input-with-btn">
+            <input id="dest-dir" type="text" placeholder="D:\FotosOrganizadas" />
+            <button id="btn-browse-dest" type="button" class="btn secondary">Examinar...</button>
+          </div>
         </label>
         <div class="scan-buttons">
           <button id="btn-start" type="button" class="btn primary">Iniciar Escaneo</button>
@@ -53,7 +59,7 @@
           <div class="folder-actions">
             <button id="btn-rename-folder" type="button" class="btn small">Renombrar</button>
             <button id="btn-merge-folder" type="button" class="btn small">Fusionar</button>
-            <button id="btn-create-folder" type="button" class="btn small">Nueva</button>
+            <button id="btn-create-folder" type="button" class="btn small">Nueva carpeta</button>
           </div>
         </div>
         <ul id="folder-list" class="folder-list" role="tree" aria-label="Carpetas"></ul>
@@ -68,7 +74,12 @@
             <button id="btn-next-page" type="button" class="btn small">Siguiente</button>
           </div>
         </div>
-        <div id="items-grid" class="items-grid" role="list" aria-label="Miniaturas de elementos"></div>
+        <div id="items-grid" class="items-grid" role="list" aria-label="Miniaturas de elementos">
+          <div class="empty-state">
+            <h3>Aún no hay elementos escaneados</h3>
+            <p>Selecciona la <strong>Carpeta Origen</strong> y la <strong>Carpeta Destino</strong> arriba, y pulsa <strong>Iniciar Escaneo</strong> para previsualizar el árbol propuesto.</p>
+          </div>
+        </div>
       </section>
 
       <aside class="preview-pane" role="region" aria-label="Vista previa y metadatos" aria-live="polite">
@@ -91,14 +102,15 @@
           <input id="cfg-ffmpeg" type="text" placeholder="ffmpeg.exe" />
         </label>
         <label>
-          Gemini API Key (opcional)
-          <input id="cfg-gemini-key" type="password" placeholder="AIza..." />
+          Comando / Ruta Antigravity CLI (opcional, por defecto: agy)
+          <input id="cfg-antigravity-cli" type="text" placeholder="agy" />
         </label>
         <label>
-          Modelo Gemini
-          <select id="cfg-gemini-model">
-            <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-            <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+          Modelo Antigravity
+          <select id="cfg-antigravity-model">
+            <option value="gemini-4-hydrogen-medium">gemini-4-hydrogen-medium</option>
+            <option value="gemini-4-carbon-medium">gemini-4-carbon-medium</option>
+            <option value="gemini-4-neon-medium">gemini-4-neon-medium</option>
           </select>
         </label>
         <div class="modal-actions">

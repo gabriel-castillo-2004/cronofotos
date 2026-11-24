@@ -146,6 +146,7 @@ class OrganizerConfig:
     time_gap_hours: float = 4.0
     gps_distance_km: float = 25.0
     max_workers: int = 4
-    gemini_model: str = "gemini-2.5-flash"
+    antigravity_cli: str = "agy"
+    gemini_model: str = "gemini-4-hydrogen-medium"
     host: str = "127.0.0.1"
     port: int = 8000

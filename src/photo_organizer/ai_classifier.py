@@ -1,7 +1,9 @@
-"""Optional Google Gemini classifier with SQLite cache, token-bucket rate limit, and breaker."""
+"""Optional Antigravity CLI (`agy`) classifier with SQLite cache and heuristic fallback."""
 
 from __future__ import annotations
 
+import re
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,10 +11,71 @@ from typing import Any, Callable
 
 from photo_organizer.db import init_db, open_connection
 
-try:  # Optional google-genai SDK
-    from google import genai  # type: ignore[import-not-found]
-except ImportError:  # pragma: no cover
-    genai = None  # type: ignore[assignment]
+DEFAULT_AGY_MODEL = "gemini-4-hydrogen-medium"
+
+
+def heuristic_classify(prompt_key: str) -> str:
+    """Derive a clean Spanish category/event label from folder and filename metadata."""
+    lower = (prompt_key or "").lower()
+    rules = (
+        (("screenshot", "captura", "pantallazo", "screen_shot"), "Capturas"),
+        (("whatsapp", "-wa0", "wa_"), "WhatsApp"),
+        (("telegram",), "Telegram"),
+        (("instagram",), "Instagram"),
+        (("download", "descarga"), "Descargas"),
+        (("document", "scan", "recibo", "factura", "pdf"), "Documentos"),
+        (("camera", "dcim"), "Camara"),
+        (("viaje", "trip", "travel", "vacacion", "playa", "beach"), "Viaje"),
+    )
+    for keywords, label in rules:
+        if any(kw in lower for kw in keywords):
+            return label
+
+    parts = [p for p in re.split(r"[/\\]+", prompt_key or "") if p]
+    for part in parts:
+        stem = Path(part).stem
+        tokens = [
+            t
+            for t in re.split(r"[\s_\-]+", stem)
+            if t and not t.isdigit() and len(t) > 2
+        ]
+        if tokens:
+            return "_".join(t.capitalize() for t in tokens[:3])
+    return "Evento_Local"
+
+
+def classify_with_agy(
+    prompt_key: str,
+    *,
+    cli_command: str = "agy",
+    model: str = DEFAULT_AGY_MODEL,
+    timeout: float = 15.0,
+) -> str:
+    """Invoke local Antigravity CLI (`agy`) via subprocess with heuristic fallback."""
+    cmd_bin = (cli_command or "agy").strip() or "agy"
+    selected_model = (model or DEFAULT_AGY_MODEL).strip() or DEFAULT_AGY_MODEL
+    prompt = (
+        "Responde únicamente con una etiqueta corta de 1 a 3 palabras en español "
+        f"(sin puntuación extra) para clasificar este archivo o carpeta: {prompt_key}"
+    )
+    try:
+        proc = subprocess.run(
+            [cmd_bin, "-m", selected_model, "-p", prompt],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            first_line = next(
+                (ln.strip() for ln in proc.stdout.splitlines() if ln.strip()),
+                "",
+            )
+            if first_line:
+                return first_line[:60]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return heuristic_classify(prompt_key)
 
 
 class TokenBucket:
@@ -45,20 +108,22 @@ def mask_api_key(api_key: str | None) -> str:
 
 
 class GeminiClassifier:
-    """Optional Gemini classifier that never halts the local pipeline on remote errors."""
+    """Optional Antigravity CLI classifier that falls back cleanly to local heuristics."""
 
     def __init__(
         self,
         db_path: Path,
         api_key: str = "",
-        model: str = "gemini-2.5-flash",
+        cli_command: str = "agy",
+        model: str = DEFAULT_AGY_MODEL,
         transport: Callable[[str], tuple[int, str]] | None = None,
         bucket_capacity: int = 10,
         refill_per_sec: float = 0.5,
     ) -> None:
         self.db_path = db_path
         self._api_key = api_key
-        self.model = model or "gemini-2.5-flash"
+        self.cli_command = (cli_command or "agy").strip() or "agy"
+        self.model = model or DEFAULT_AGY_MODEL
         self._transport = transport
         self.bucket = TokenBucket(capacity=bucket_capacity, refill_per_sec=refill_per_sec)
         self.consecutive_failures = 0
@@ -68,9 +133,9 @@ class GeminiClassifier:
 
     def get_masked_settings(self) -> dict[str, Any]:
         return {
-            "api_key": mask_api_key(self._api_key),
+            "antigravity_cli": self.cli_command,
             "model": self.model,
-            "configured": bool(self._api_key),
+            "configured": bool(self.cli_command),
             "circuit_open": self.circuit_open,
         }
 
@@ -101,32 +166,21 @@ class GeminiClassifier:
             conn.close()
 
     def _default_transport(self, prompt_key: str) -> tuple[int, str]:
-        if not self._api_key or genai is None:
-            return (503, "")
-        try:
-            client = genai.Client(api_key=self._api_key)
-            resp = client.models.generate_content(
-                model=self.model,
-                contents=f"Give a short 2-4 word Spanish event/category label for: {prompt_key}",
-            )
-            text = (getattr(resp, "text", "") or "").strip()
-            return (200, text or "Evento")
-        except Exception as exc:
-            msg = str(exc)
-            if "429" in msg:
-                return (429, "")
-            if "401" in msg or "403" in msg or "API_KEY" in msg.upper():
-                return (401, "")
-            return (500, "")
+        label = classify_with_agy(
+            prompt_key,
+            cli_command=self.cli_command,
+            model=self.model,
+        )
+        return (200, label)
 
     def classify(self, cache_key: str, kind: str = "item") -> str:
-        """Classify an item or cluster signature with cache, rate-limit, and circuit breaker."""
+        """Classify an item or cluster signature with cache, rate-limit, and heuristic fallback."""
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
 
-        if self.circuit_open or not self._api_key or not self.bucket.acquire():
-            return "unclassified_local_fallback"
+        if self.circuit_open or not self.bucket.acquire():
+            return heuristic_classify(cache_key)
 
         self.remote_calls += 1
         transport = self._transport or self._default_transport
@@ -135,10 +189,10 @@ class GeminiClassifier:
             self.consecutive_failures += 1
             if self.consecutive_failures >= 2:
                 self.circuit_open = True
-            return "unclassified_local_fallback"
+            return heuristic_classify(cache_key)
 
         self.consecutive_failures = 0
-        clean_label = label.strip() or "Evento"
+        clean_label = label.strip() or heuristic_classify(cache_key)
         self._put_cached(cache_key, kind, clean_label)
         return clean_label
 
