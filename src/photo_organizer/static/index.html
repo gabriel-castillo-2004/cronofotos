@@ -5,43 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CronoFotos · Piloto Automático</title>
     <link rel="stylesheet" href="/static/styles.css" />
-    <style>
-      .folder-item {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 0.35rem;
-      }
-      .folder-label {
-        flex: 1;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .btn-inline-rename {
-        background: transparent;
-        border: none;
-        color: inherit;
-        cursor: pointer;
-        opacity: 0.6;
-        padding: 0.1rem 0.25rem;
-        font-size: 0.85rem;
-        line-height: 1;
-        border-radius: 4px;
-      }
-      .btn-inline-rename:hover,
-      .btn-inline-rename:focus-visible {
-        opacity: 1;
-        background: rgba(148, 163, 184, 0.18);
-      }
-      .inline-rename-input {
-        flex: 1;
-        min-width: 0;
-        font-size: 0.8rem;
-        padding: 0.15rem 0.35rem;
-      }
-    </style>
   </head>
   <body>
     <header class="topbar">
@@ -50,151 +13,173 @@
         <span id="health-badges" class="badges"></span>
       </div>
       <div class="topbar-actions">
-        <button id="btn-theme" type="button" class="btn secondary" aria-label="Cambiar tema claro u oscuro">Tema</button>
-        <button id="btn-settings" type="button" class="btn secondary">Configuración</button>
+        <button id="btn-theme" type="button" class="btn secondary small" aria-label="Cambiar tema claro u oscuro">Tema</button>
+        <button id="btn-settings" type="button" class="btn secondary small">Configuración</button>
       </div>
     </header>
 
     <section class="controls-panel" aria-label="Controles de Piloto Automático">
       <div class="path-inputs">
-        <label>
-          Carpeta con fotos nuevas
+        <label class="path-field">
+          <span>Carpeta con fotos nuevas</span>
           <div class="input-with-btn">
             <input id="source-dir" type="text" placeholder="C:\Users\...\Takeout o Fotos" />
-            <button id="btn-browse-source" type="button" class="btn secondary">Examinar...</button>
+            <button id="btn-browse-source" type="button" class="btn secondary small">Examinar...</button>
           </div>
         </label>
-        <label>
-          Mi Biblioteca Organizada
+        <label class="path-field">
+          <span>Mi Biblioteca Organizada</span>
           <div class="input-with-btn">
             <input id="dest-dir" type="text" placeholder="D:\Mi_Biblioteca_Organizada" />
-            <button id="btn-browse-dest" type="button" class="btn secondary">Examinar...</button>
-          </div>
-        </label>
-        <label>
-          Índice maestro previo (_cronofotos_index.json)
-          <div class="input-with-btn">
-            <input id="master-index-path" type="text" placeholder="Opcional: ruta a _cronofotos_index.json o master_index.json" />
+            <button id="btn-browse-dest" type="button" class="btn secondary small">Examinar...</button>
           </div>
         </label>
         <div class="autopilot-cta">
-          <button id="btn-start" type="button" class="btn primary btn-autopilot">Organizar Automáticamente</button>
           <label class="checkbox-label discreet-check">
             <input id="solo-primer-lote" type="checkbox" />
             <span>Modo prueba (100 archivos)</span>
           </label>
-          <label class="checkbox-label discreet-check">
-            <input id="incremental-mode" type="checkbox" />
-            <span>Modo incremental (exportar solo archivos nuevos)</span>
-          </label>
-          <label class="checkbox-label discreet-check">
-            <input id="delta-mode" type="checkbox" />
-            <span>Solo archivos nuevos (Delta contra plan/índice previo)</span>
-          </label>
+          <button id="btn-start" type="button" class="btn primary btn-autopilot">Organizar Automáticamente</button>
         </div>
       </div>
 
-      <div class="progress-wrap" role="status" aria-live="polite">
-        <div class="progress-meta">
-          <span id="progress-phase" class="phase-pill">1/4 Depurando duplicados</span>
-          <span id="progress-stage" class="muted">En espera</span>
-          <span id="progress-stats" class="muted">0 / 0 archivos · 0.0 items/s</span>
-        </div>
-        <progress id="progress-bar" max="100" value="0" aria-label="Progreso de organización"></progress>
-        <div class="phase-steps" aria-hidden="true">
-          <span class="phase-step" data-phase="1">1/4 Depurando duplicados</span>
-          <span class="phase-step" data-phase="2">2/4 Clasificando fotos y capturas</span>
-          <span class="phase-step" data-phase="3">3/4 Nombrando carpetas con IA</span>
-          <span class="phase-step" data-phase="4">4/4 Listo</span>
-        </div>
-        <div class="summary-counters">
-          <span class="counter-chip">Nuevas: <strong id="cnt-new">0</strong></span>
-          <span class="counter-chip">Duplicadas omitidas: <strong id="cnt-dups">0</strong></span>
-          <span class="counter-chip">Capturas separadas: <strong id="cnt-screenshots">0</strong></span>
-          <span id="cnt-placeholders-chip" class="counter-chip hidden">Solo en la nube (OneDrive): <strong id="cnt-placeholders">0</strong></span>
-        </div>
-      </div>
-
-      <div class="action-toolbar">
-        <div class="primary-actions">
-          <button id="btn-ai-regenerate" type="button" class="btn secondary">Regenerar nombres con IA</button>
-          <button id="btn-ai-optimize" type="button" class="btn secondary">✨ Optimizar Árbol con IA</button>
-          <button id="btn-ai-debate" type="button" class="btn secondary">Debate IA (2 Agentes)</button>
-          <button id="btn-ai-debate-resume" type="button" class="btn secondary" disabled>Reanudar Debate IA</button>
-          <span id="ai-debate-progress" class="badge muted-badge hidden"></span>
-          <button id="btn-ai-cancel-run" type="button" class="btn small hidden">Cancelar IA</button>
-          <button id="btn-export-plan" type="button" class="btn secondary">Exportar Plan (.json)</button>
-          <button id="btn-import-plan" type="button" class="btn secondary">Importar Plan (.json)</button>
-          <input id="import-plan-file" type="file" accept=".json,application/json" class="hidden" />
-          <button id="btn-refine-tree" type="button" class="btn secondary">Refinar árbol ya exportado</button>
-          <button id="btn-export" type="button" class="btn primary">Aplicar y Exportar Árbol</button>
-          <button id="btn-open-dest" type="button" class="btn secondary hidden">Abrir carpeta destino</button>
-        </div>
-
-        <section id="ai-optimizer-panel" class="ai-optimizer-panel hidden" aria-label="Optimizar Árbol con IA">
-          <div class="ai-optimizer-header">
-            <div>
-              <strong>✨ Optimizar Árbol con IA (Análisis Visual y Estructural)</strong>
-              <span id="ai-optimizer-engine" class="badge muted-badge"></span>
-            </div>
-            <div class="ai-optimizer-actions">
-              <button id="btn-ai-apply-suggestions" type="button" class="btn primary small">Aplicar sugerencias seleccionadas</button>
-              <button id="btn-ai-close-panel" type="button" class="btn small">Cerrar</button>
-            </div>
-          </div>
-          <div id="ai-suggestions-list" class="ai-suggestions-list"></div>
-        </section>
-
-        <details id="advanced-menu" class="advanced-menu">
-          <summary>Ajustes avanzados</summary>
-          <div class="advanced-body">
-            <div class="advanced-row">
-              <div class="scan-buttons">
-                <button id="btn-pause" type="button" class="btn small" disabled>Pausar</button>
-                <button id="btn-resume" type="button" class="btn small" disabled>Reanudar</button>
-              </div>
-              <div class="batch-controls">
-                <label class="batch-size-label">
-                  Tamaño de lote
-                  <select id="batch-size">
-                    <option value="50">50</option>
-                    <option value="100" selected>100</option>
-                    <option value="250">250</option>
-                    <option value="500">500</option>
-                  </select>
-                </label>
-                <label class="batch-size-label">
-                  Umbral de tiempo (h)
-                  <input id="time-gap-hours" type="number" min="0.5" max="168" step="0.5" value="4" style="width:68px" />
-                </label>
-                <label class="batch-size-label">
-                  Distancia GPS (km)
-                  <input id="gps-distance-km" type="number" min="1" max="500" step="1" value="25" style="width:68px" />
-                </label>
-              </div>
-            </div>
-            <div class="advanced-row">
-              <span class="muted">Edición manual del árbol:</span>
-              <div class="folder-actions">
-                <button id="btn-rename-folder" type="button" class="btn small">Renombrar</button>
-                <button id="btn-merge-folder" type="button" class="btn small">Fusionar</button>
-                <button id="btn-create-folder" type="button" class="btn small">Nueva carpeta</button>
-              </div>
-            </div>
-            <div class="batch-summary-line muted">
-              Progreso por lotes (<span id="batch-summary-count">0 lotes</span>)
-            </div>
-            <div id="batch-list" class="batch-list"></div>
+      <div class="controls-subrow">
+        <details id="incremental-options" class="incremental-options">
+          <summary>Opciones incrementales</summary>
+          <div class="incremental-options-body">
+            <label class="checkbox-label discreet-check">
+              <input id="incremental-mode" type="checkbox" />
+              <span>Modo incremental (solo archivos nuevos)</span>
+            </label>
+            <label class="incremental-index-label">
+              <span>Índice maestro previo (_cronofotos_index.json)</span>
+              <input id="master-index-path" type="text" placeholder="Opcional: ruta a _cronofotos_index.json o master_index.json" />
+            </label>
           </div>
         </details>
+
+        <div class="action-toolbar">
+          <div class="primary-actions">
+            <details id="ai-menu" class="dropdown-menu">
+              <summary class="btn secondary small">✨ Mejorar con IA</summary>
+              <div class="dropdown-menu-body">
+                <button id="btn-ai-debate" type="button" class="menu-item">Debate IA (2 Agentes)</button>
+                <button id="btn-ai-optimize" type="button" class="menu-item">Optimizar Árbol con IA</button>
+                <button id="btn-ai-regenerate" type="button" class="menu-item">Regenerar nombres con IA</button>
+                <button id="btn-ai-debate-resume" type="button" class="menu-item" disabled>Reanudar Debate IA</button>
+              </div>
+            </details>
+
+            <details id="more-options-menu" class="dropdown-menu">
+              <summary class="btn secondary small">⋯ Más opciones</summary>
+              <div class="dropdown-menu-body dropdown-menu-wide">
+                <button id="btn-export-plan" type="button" class="menu-item">Exportar Plan (.json)</button>
+                <button id="btn-import-plan" type="button" class="menu-item">Importar Plan (.json)</button>
+                <input id="import-plan-file" type="file" accept=".json,application/json" class="hidden" />
+                <button id="btn-refine-tree" type="button" class="menu-item">Refinar árbol ya exportado</button>
+                <details id="advanced-menu" class="advanced-menu">
+                  <summary>Ajustes avanzados</summary>
+                  <div class="advanced-body">
+                    <div class="advanced-row">
+                      <div class="scan-buttons">
+                        <button id="btn-pause" type="button" class="btn small" disabled>Pausar</button>
+                        <button id="btn-resume" type="button" class="btn small" disabled>Reanudar</button>
+                      </div>
+                      <div class="batch-controls">
+                        <label class="batch-size-label">
+                          Tamaño de lote
+                          <select id="batch-size">
+                            <option value="50">50</option>
+                            <option value="100" selected>100</option>
+                            <option value="250">250</option>
+                            <option value="500">500</option>
+                          </select>
+                        </label>
+                        <label class="batch-size-label">
+                          Umbral (h)
+                          <input id="time-gap-hours" type="number" min="0.5" max="168" step="0.5" value="4" style="width:60px" />
+                        </label>
+                        <label class="batch-size-label">
+                          GPS (km)
+                          <input id="gps-distance-km" type="number" min="1" max="500" step="1" value="25" style="width:60px" />
+                        </label>
+                      </div>
+                    </div>
+                    <div class="advanced-row">
+                      <span class="muted">Edición manual del árbol:</span>
+                      <div class="folder-actions">
+                        <button id="btn-rename-folder" type="button" class="btn small">Renombrar</button>
+                        <button id="btn-merge-folder" type="button" class="btn small">Fusionar</button>
+                        <button id="btn-create-folder" type="button" class="btn small">Nueva carpeta</button>
+                      </div>
+                    </div>
+                    <div class="batch-summary-line muted">
+                      Progreso por lotes (<span id="batch-summary-count">0 lotes</span>)
+                    </div>
+                    <div id="batch-list" class="batch-list"></div>
+                  </div>
+                </details>
+              </div>
+            </details>
+
+            <span id="ai-debate-progress" class="badge muted-badge hidden"></span>
+            <button id="btn-ai-cancel-run" type="button" class="btn small hidden">Cancelar IA</button>
+            <button id="btn-open-dest" type="button" class="btn secondary small hidden">Abrir carpeta destino</button>
+            <button id="btn-export" type="button" class="btn primary small">Aplicar y Exportar Árbol</button>
+          </div>
+        </div>
+      </div>
+
+      <section id="ai-optimizer-panel" class="ai-optimizer-panel hidden" aria-label="Optimizar Árbol con IA">
+        <div class="ai-optimizer-header">
+          <div>
+            <strong>✨ Optimizar Árbol con IA (Análisis Visual y Estructural)</strong>
+            <span id="ai-optimizer-engine" class="badge muted-badge"></span>
+          </div>
+          <div class="ai-optimizer-actions">
+            <button id="btn-ai-apply-suggestions" type="button" class="btn primary small">Aplicar sugerencias seleccionadas</button>
+            <button id="btn-ai-close-panel" type="button" class="btn small">Cerrar</button>
+          </div>
+        </div>
+        <div id="ai-suggestions-list" class="ai-suggestions-list"></div>
+      </section>
+
+      <div class="progress-wrap" role="status" aria-live="polite">
+        <div class="progress-stepper-row">
+          <div class="phase-steps" aria-label="Progreso por fases">
+            <span class="phase-step active" data-phase="1">1. Duplicados</span>
+            <span class="phase-sep" aria-hidden="true">→</span>
+            <span class="phase-step" data-phase="2">2. Clasificación</span>
+            <span class="phase-sep" aria-hidden="true">→</span>
+            <span class="phase-step" data-phase="3">3. IA</span>
+            <span class="phase-sep" aria-hidden="true">→</span>
+            <span class="phase-step" data-phase="4">4. Listo</span>
+          </div>
+          <div class="progress-status-inline">
+            <span id="progress-phase" class="phase-pill">1/4 Depurando duplicados</span>
+            <span id="progress-stage" class="muted">En espera</span>
+          </div>
+        </div>
+        <progress id="progress-bar" max="100" value="0" aria-label="Progreso de organización"></progress>
+        <div class="telemetry-line">
+          <div class="summary-counters">
+            <span class="counter-chip">Nuevas: <strong id="cnt-new">0</strong></span>
+            <span class="counter-chip">Duplicadas omitidas: <strong id="cnt-dups">0</strong></span>
+            <span class="counter-chip">Capturas separadas: <strong id="cnt-screenshots">0</strong></span>
+            <span id="cnt-placeholders-chip" class="counter-chip hidden">Solo en la nube (OneDrive): <strong id="cnt-placeholders">0</strong></span>
+            <span id="progress-stats" class="counter-stat muted">0 / 0 archivos · 0.0 archivos/s</span>
+          </div>
+          <details id="activity-log-panel" class="activity-panel">
+            <summary>
+              <span class="activity-title">Actividad en vivo</span>
+              <span id="activity-latest" class="activity-latest muted">En espera</span>
+            </summary>
+            <ul id="activity-log" class="activity-log"></ul>
+          </details>
+        </div>
       </div>
 
       <div id="result-toast" class="toast-banner hidden" role="status" aria-live="polite"></div>
-
-      <details id="activity-log-panel" class="activity-panel">
-        <summary>Actividad en vivo</summary>
-        <ul id="activity-log" class="activity-log"></ul>
-      </details>
     </section>
 
     <main class="workspace">
@@ -226,7 +211,9 @@
       </section>
 
       <aside class="preview-pane" role="region" aria-label="Vista previa y metadatos" aria-live="polite">
-        <h2>Vista Previa</h2>
+        <div class="pane-header">
+          <h2>Vista Previa</h2>
+        </div>
         <div id="preview-box" class="preview-box">
           <p class="muted">Selecciona un elemento para ver su miniatura y metadatos.</p>
         </div>

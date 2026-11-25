@@ -117,17 +117,18 @@ def test_mod17_01_ui_incremental_delta_controls() -> None:
     html = _read_static("index.html")
     js = _read_static("app.js")
 
-    assert "Índice maestro previo (_cronofotos_index.json)" in html
-    assert "Modo incremental (exportar solo archivos nuevos)" in html
+    assert "Índice maestro previo" in html
+    assert "Modo incremental" in html
 
     # Verify there is a text/path input for the previous master index and a checkbox for incremental mode
     assert re.search(
-        r"Índice maestro previo \(_cronofotos_index\.json\)[\s\S]{0,400}<input[^>]+>",
+        r"Índice maestro previo[\s\S]{0,400}<input[^>]+id=[\"']master-index-path[\"'][^>]*>",
         html,
     )
     assert re.search(
-        r"<input[^>]+type=[\"']checkbox[\"'][^>]*>[\s\S]{0,120}Modo incremental \(exportar solo archivos nuevos\)"
-        r"|Modo incremental \(exportar solo archivos nuevos\)[\s\S]{0,120}<input[^>]+type=[\"']checkbox[\"']",
+        r"<input[^>]+id=[\"']incremental-mode[\"'][^>]+type=[\"']checkbox[\"'][^>]*>[\s\S]{0,120}Modo incremental"
+        r"|<input[^>]+type=[\"']checkbox[\"'][^>]+id=[\"']incremental-mode[\"'][^>]*>[\s\S]{0,120}Modo incremental"
+        r"|Modo incremental[\s\S]{0,120}<input[^>]+type=[\"']checkbox[\"'][^>]*>",
         html,
     )
 

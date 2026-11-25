@@ -117,15 +117,15 @@ def _discover_refine_endpoint(js: str) -> str | None:
 
 
 def test_mod19_01_ui_refine_and_delta_controls() -> None:
-    """UI exposes 'Refinar árbol ya exportado' button and 'Solo archivos nuevos (Delta contra plan/índice previo)' checkbox."""
+    """UI exposes 'Refinar árbol ya exportado' button and single incremental/delta checkbox wired in app.js."""
     html = _read_static("index.html")
     js = _read_static("app.js")
 
     assert "Refinar árbol ya exportado" in html
-    assert "Solo archivos nuevos (Delta contra plan/índice previo)" in html
+    assert "Modo incremental" in html
     assert re.search(
-        r"<input[^>]+type=[\"']checkbox[\"'][^>]*>[\s\S]{0,160}Solo archivos nuevos \(Delta contra plan/índice previo\)"
-        r"|Solo archivos nuevos \(Delta contra plan/índice previo\)[\s\S]{0,160}<input[^>]+type=[\"']checkbox[\"']",
+        r"<input[^>]+id=[\"']incremental-mode[\"'][^>]*>"
+        r"|Modo incremental[\s\S]{0,160}<input[^>]+type=[\"']checkbox[\"'][^>]*>",
         html,
     )
 
