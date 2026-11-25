@@ -115,7 +115,13 @@
         <div class="primary-actions">
           <button id="btn-ai-regenerate" type="button" class="btn secondary">Regenerar nombres con IA</button>
           <button id="btn-ai-optimize" type="button" class="btn secondary">✨ Optimizar Árbol con IA</button>
+          <button id="btn-ai-debate" type="button" class="btn secondary">Debate IA (2 Agentes)</button>
+          <button id="btn-ai-debate-resume" type="button" class="btn secondary" disabled>Reanudar Debate IA</button>
+          <span id="ai-debate-progress" class="badge muted-badge hidden"></span>
           <button id="btn-ai-cancel-run" type="button" class="btn small hidden">Cancelar IA</button>
+          <button id="btn-export-plan" type="button" class="btn secondary">Exportar Plan (.json)</button>
+          <button id="btn-import-plan" type="button" class="btn secondary">Importar Plan (.json)</button>
+          <input id="import-plan-file" type="file" accept=".json,application/json" class="hidden" />
           <button id="btn-export" type="button" class="btn primary">Aplicar y Exportar Árbol</button>
           <button id="btn-open-dest" type="button" class="btn secondary hidden">Abrir carpeta destino</button>
         </div>

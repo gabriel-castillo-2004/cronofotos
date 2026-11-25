@@ -926,6 +926,112 @@ function bindEvents() {
     };
   }
 
+  async function runAiDebate(isResume) {
+    if (!state.jobId) return showToast("Primero ejecuta Organizar Automáticamente.", "warn");
+    const btnId = isResume ? "btn-ai-debate-resume" : "btn-ai-debate";
+    const restore = setActionBusy(btnId, isResume ? "Reanudando Debate IA..." : "Ejecutando Debate IA...");
+    const progEl = $("ai-debate-progress");
+    $("progress-stage").textContent = "Estado: Debate IA (Curador y Auditor) en progreso...";
+    logActivity(isResume ? "Reanudando Debate IA desde carpetas pendientes..." : "Iniciando Debate IA (2 Agentes)...");
+    try {
+      const res = await api("/api/tree/ai-debate", "POST", {
+        job_id: state.jobId,
+        resume: Boolean(isResume),
+      });
+      const label =
+        res.progress_label || `${res.completed_folders || 0}/${res.total_folders || 0} carpetas listas`;
+      if (progEl) {
+        progEl.textContent = label;
+        progEl.classList.remove("hidden");
+      }
+      const resumeBtn = $("btn-ai-debate-resume");
+      if (resumeBtn) {
+        resumeBtn.disabled = !res.paused;
+      }
+      if (res.paused) {
+        const msg = `Debate IA en pausa (${label}): ${res.pause_reason || "límite de cuota/autenticación"}`;
+        $("progress-stage").textContent = `Estado: ${msg}`;
+        showToast(msg, "warn");
+        logActivity(msg);
+      } else {
+        const msg = `Debate IA completado (${label}).`;
+        $("progress-stage").textContent = `Estado: ${msg}`;
+        showToast(msg, "ok");
+        logActivity(msg);
+      }
+      await loadTree();
+    } catch (err) {
+      showToast(`Error en Debate IA: ${err.message}`, "warn");
+      logActivity(`Error en Debate IA: ${err.message}`);
+    } finally {
+      restore();
+    }
+  }
+
+  if ($("btn-ai-debate")) {
+    $("btn-ai-debate").onclick = () => runAiDebate(false);
+  }
+  if ($("btn-ai-debate-resume")) {
+    $("btn-ai-debate-resume").onclick = () => runAiDebate(true);
+  }
+
+  if ($("btn-export-plan")) {
+    $("btn-export-plan").onclick = async () => {
+      if (!state.jobId) return showToast("Primero ejecuta Organizar Automáticamente.", "warn");
+      const restore = setActionBusy("btn-export-plan", "Exportando plan...");
+      try {
+        const res = await api("/api/tree/plan/export", "POST", { job_id: state.jobId });
+        if (res && res.plan) {
+          const blob = new Blob([JSON.stringify(res.plan, null, 2)], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "_cronofotos_plan.json";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        }
+        const msg = `Plan exportado en ${res.plan_path || "_cronofotos_plan.json"}`;
+        showToast(msg, "ok");
+        logActivity(msg);
+      } catch (err) {
+        showToast(`Error al exportar plan: ${err.message}`, "warn");
+      } finally {
+        restore();
+      }
+    };
+  }
+
+  if ($("btn-import-plan") && $("import-plan-file")) {
+    $("btn-import-plan").onclick = () => {
+      if (!state.jobId) return showToast("Primero ejecuta Organizar Automáticamente.", "warn");
+      $("import-plan-file").click();
+    };
+    $("import-plan-file").onchange = async (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      try {
+        const raw = await file.text();
+        const plan = JSON.parse(raw);
+        const res = await api("/api/tree/plan/import", "POST", {
+          job_id: state.jobId,
+          plan,
+        });
+        showToast(
+          `Plan importado (${res.updated_items || 0} archivos, ${res.folders_synced || 0} carpetas).`,
+          "ok"
+        );
+        logActivity(`Plan importado desde ${file.name}`);
+        await loadTree();
+      } catch (err) {
+        showToast(`Error al importar plan: ${err.message}`, "warn");
+      } finally {
+        ev.target.value = "";
+      }
+    };
+  }
+
   if ($("btn-ai-classify")) {
     $("btn-ai-classify").onclick = async () => {
       if (!state.jobId || state.items.length === 0) return;
