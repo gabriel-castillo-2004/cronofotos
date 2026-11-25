@@ -4,10 +4,23 @@ const state = {
   page: 1,
   pageSize: 40,
   totalItems: 0,
+  treeItemCount: 0,
   items: [],
   sse: null,
   lastLoggedPlaceholders: 0,
 };
+
+const STATUS_LABELS = {
+  "idle": "En espera",
+};
+
+function updateExportButtonState() {
+  const exportBtn = $("btn-export");
+  if (!exportBtn) return;
+  const ready = Boolean(state.jobId) && state.treeItemCount > 0;
+  exportBtn.disabled = !ready;
+  exportBtn.classList.toggle("export-ready", ready);
+}
 
 const $ = (id) => document.getElementById(id);
 
@@ -105,9 +118,13 @@ function setActionBusy(activeBtnId, busyText) {
     for (const id of actionIds) {
       const el = $(id);
       if (!el) continue;
-      el.disabled = false;
       if (originals[id] !== undefined) {
         el.textContent = originals[id];
+      }
+      if (id === "btn-export") {
+        updateExportButtonState();
+      } else {
+        el.disabled = false;
       }
     }
   };
@@ -197,7 +214,8 @@ function updateProgressUI(snap) {
   if (snap.job_id) state.jobId = snap.job_id;
   const phaseLabel = snap.phase_label || PHASE_MAP[snap.stage] || "1/4 Depurando duplicados";
   if ($("progress-phase")) $("progress-phase").textContent = phaseLabel;
-  $("progress-stage").textContent = `Estado: ${snap.status}`;
+  const statusText = STATUS_LABELS[snap.status] || snap.status || "En espera";
+  $("progress-stage").textContent = `Estado: ${statusText}`;
   $("progress-stats").textContent =
     `${snap.processed_files} / ${snap.total_files} archivos · ${snap.items_per_sec} archivos/s`;
 
@@ -263,6 +281,9 @@ async function loadTree() {
   const data = await api(`/api/tree?${params.toString()}`);
   state.totalItems = data.total || 0;
   state.items = data.items || [];
+  const folderItemSum = (data.folders || []).reduce((acc, f) => acc + Number(f.count || 0), 0);
+  state.treeItemCount = Math.max(state.totalItems, folderItemSum);
+  updateExportButtonState();
 
   const folderList = $("folder-list");
   folderList.innerHTML = "";
@@ -400,6 +421,12 @@ async function loadTree() {
       : "Selecciona tu Carpeta con fotos nuevas y Mi Biblioteca Organizada arriba, y pulsa Organizar Automáticamente.";
     empty.appendChild(h3);
     empty.appendChild(p);
+    if (!state.jobId) {
+      const note = document.createElement("p");
+      note.className = "empty-state-note muted";
+      note.textContent = "Tus archivos originales nunca se modifican ni se eliminan.";
+      empty.appendChild(note);
+    }
     grid.appendChild(empty);
     return;
   }
@@ -1222,4 +1249,5 @@ function bindEvents() {
 
 refreshHealth();
 bindEvents();
+updateExportButtonState();
 connectSSE();

@@ -173,6 +173,19 @@ body {
   cursor: not-allowed;
 }
 
+#btn-export:not(:disabled),
+#btn-export.export-ready:not(:disabled) {
+  background: #16a34a;
+  color: #ffffff;
+  border-color: transparent;
+  font-weight: 600;
+}
+
+#btn-export:not(:disabled):hover,
+#btn-export.export-ready:not(:disabled):hover {
+  background: #15803d;
+}
+
 .btn:focus-visible,
 input:focus-visible,
 select:focus-visible,
@@ -769,6 +782,11 @@ progress {
   max-width: 440px;
   font-size: 0.82rem;
   line-height: 1.5;
+}
+
+.empty-state .empty-state-note {
+  margin-top: 0.6rem;
+  font-size: 0.75rem;
 }
 
 .item-card {
