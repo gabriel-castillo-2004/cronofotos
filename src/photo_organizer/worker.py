@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from photo_organizer.ai_classifier import DEFAULT_AGY_MODEL, classify_with_agy
-from photo_organizer.clustering import ClusterItem, cluster_and_stage_items
+from photo_organizer.clustering import ClusterItem, cluster_and_stage_items, offline_reverse_geocode
 from photo_organizer.config import (
     IGNORED_SIDECAR_EXTENSIONS,
     MEDIA_EXTENSIONS,
@@ -273,7 +273,8 @@ class PipelineOrchestrator:
 
             discovered: list[_DiscoveredMedia] = []
             size_groups: dict[int, list[_DiscoveredMedia]] = {}
-            for fpath in raw_paths:
+            total_raw = len(raw_paths)
+            for idx, fpath in enumerate(raw_paths, start=1):
                 item_id = uuid.uuid4().hex
                 ext = fpath.suffix.lower()
                 if is_onedrive_placeholder(fpath):
@@ -297,6 +298,11 @@ class PipelineOrchestrator:
                     )
                     discovered.append(entry)
                     size_groups.setdefault(sz, []).append(entry)
+                if idx % 25 == 0 or idx == total_raw:
+                    self._current_snapshot.processed_files = idx
+                    elapsed = max(0.001, time.monotonic() - start_ts)
+                    self._current_snapshot.items_per_sec = idx / elapsed
+                    self._emit(force=True)
 
             loop = asyncio.get_running_loop()
             seen_hashes: set[str] = set()
@@ -515,9 +521,10 @@ class PipelineOrchestrator:
                 ym_prefix = parts[2].split(" - ")[0]
                 sample = group_items[0]
                 orig_parent = Path(sample.source_path).parent.name
+                loc_label = offline_reverse_geocode(sample.latitude, sample.longitude)
                 gps_txt = (
-                    f" | GPS: {sample.latitude:.2f},{sample.longitude:.2f}"
-                    if sample.latitude is not None and sample.longitude is not None
+                    f" | GPS: {loc_label}"
+                    if loc_label and not loc_label.startswith("GPS ")
                     else ""
                 )
                 summary = f"{ym_prefix} | {len(group_items)} fotos | carpeta: {orig_parent}{gps_txt}"

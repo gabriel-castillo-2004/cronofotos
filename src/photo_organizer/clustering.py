@@ -149,6 +149,8 @@ def cluster_and_stage_items(
         new_cluster = False
         if prev_dt is None:
             new_cluster = True
+        elif dt.date() != prev_dt.date():
+            new_cluster = True
         else:
             gap_hours = (dt - prev_dt).total_seconds() / 3600.0
             if gap_hours > time_gap_hours:
@@ -164,13 +166,14 @@ def cluster_and_stage_items(
 
         if new_cluster:
             cluster_idx += 1
-            cluster_location = offline_reverse_geocode(item.latitude, item.longitude)
+            loc = offline_reverse_geocode(item.latitude, item.longitude)
+            cluster_location = None if (loc and loc.startswith("GPS ")) else loc
 
         year = dt.strftime("%Y")
-        ym = dt.strftime("%Y-%m")
-        event_name = item.ai_label or cluster_location or f"Evento {cluster_idx:03d}"
+        ymd = dt.strftime("%Y-%m-%d")
+        event_name = item.ai_label or cluster_location or "Eventos del día"
         safe_event = re.sub(r'[<>:"/\\|?*]', "_", event_name).strip()
-        target_folder = f"01_Recuerdos/{year}/{ym} - {safe_event}"
+        target_folder = f"01_Recuerdos/{year}/{ymd} - {safe_event}"
 
         staged[item.id] = {
             "target_folder": target_folder,
