@@ -3,89 +3,118 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Organizador Local de Fotos y Videos</title>
+    <title>CronoFotos · Piloto Automático</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <header class="topbar">
       <div class="brand">
-        <h1>Organizador Local de Fotos</h1>
+        <h1>CronoFotos</h1>
         <span id="health-badges" class="badges"></span>
       </div>
       <div class="topbar-actions">
         <button id="btn-theme" type="button" class="btn secondary" aria-label="Cambiar tema claro u oscuro">Tema</button>
         <button id="btn-settings" type="button" class="btn secondary">Configuración</button>
-        <button id="btn-ai-classify" type="button" class="btn secondary">Clasificar con IA</button>
-        <button id="btn-export" type="button" class="btn primary">Aplicar y Exportar Árbol</button>
       </div>
     </header>
 
-    <section class="controls-panel" aria-label="Controles de escaneo">
+    <section class="controls-panel" aria-label="Controles de Piloto Automático">
       <div class="path-inputs">
         <label>
-          Carpeta Origen
+          Carpeta con fotos nuevas
           <div class="input-with-btn">
-            <input id="source-dir" type="text" placeholder="C:\Users\...\Takeout" />
+            <input id="source-dir" type="text" placeholder="C:\Users\...\Takeout o Fotos" />
             <button id="btn-browse-source" type="button" class="btn secondary">Examinar...</button>
           </div>
         </label>
         <label>
-          Carpeta Destino
+          Mi Biblioteca Organizada
           <div class="input-with-btn">
-            <input id="dest-dir" type="text" placeholder="D:\FotosOrganizadas" />
+            <input id="dest-dir" type="text" placeholder="D:\Mi_Biblioteca_Organizada" />
             <button id="btn-browse-dest" type="button" class="btn secondary">Examinar...</button>
           </div>
         </label>
-        <div class="scan-buttons">
-          <button id="btn-start" type="button" class="btn primary">Iniciar Escaneo</button>
-          <button id="btn-pause" type="button" class="btn secondary" disabled>Pausar</button>
-          <button id="btn-resume" type="button" class="btn secondary" disabled>Reanudar</button>
+        <div class="autopilot-cta">
+          <button id="btn-start" type="button" class="btn primary btn-autopilot">Organizar Automáticamente</button>
+          <label class="checkbox-label discreet-check">
+            <input id="solo-primer-lote" type="checkbox" />
+            <span>Modo prueba (100 archivos)</span>
+          </label>
         </div>
-      </div>
-
-      <div class="batch-controls">
-        <label class="batch-size-label">
-          Tamaño de lote
-          <select id="batch-size">
-            <option value="50">50</option>
-            <option value="100" selected>100</option>
-            <option value="250">250</option>
-            <option value="500">500</option>
-          </select>
-        </label>
-        <label class="checkbox-label">
-          <input id="solo-primer-lote" type="checkbox" />
-          <span>Probar solo 1 lote</span>
-        </label>
       </div>
 
       <div class="progress-wrap" role="status" aria-live="polite">
         <div class="progress-meta">
-          <span id="progress-stage">Estado: idle</span>
-          <span id="progress-stats">0 / 0 archivos · 0.0 items/s</span>
+          <span id="progress-phase" class="phase-pill">1/4 Depurando duplicados</span>
+          <span id="progress-stage" class="muted">En espera</span>
+          <span id="progress-stats" class="muted">0 / 0 archivos · 0.0 items/s</span>
         </div>
-        <progress id="progress-bar" max="100" value="0" aria-label="Progreso del escaneo"></progress>
+        <progress id="progress-bar" max="100" value="0" aria-label="Progreso de organización"></progress>
+        <div class="phase-steps" aria-hidden="true">
+          <span class="phase-step" data-phase="1">1/4 Depurando duplicados</span>
+          <span class="phase-step" data-phase="2">2/4 Clasificando fotos y capturas</span>
+          <span class="phase-step" data-phase="3">3/4 Nombrando carpetas con IA</span>
+          <span class="phase-step" data-phase="4">4/4 Listo</span>
+        </div>
+        <div class="summary-counters">
+          <span class="counter-chip">Nuevas: <strong id="cnt-new">0</strong></span>
+          <span class="counter-chip">Duplicadas omitidas: <strong id="cnt-dups">0</strong></span>
+          <span class="counter-chip">Capturas separadas: <strong id="cnt-screenshots">0</strong></span>
+        </div>
       </div>
 
-      <details id="batch-panel" class="batch-panel" open>
-        <summary>
-          Progreso por lotes (<span id="batch-summary-count">0 lotes</span>)
-        </summary>
-        <div id="batch-list" class="batch-list">
-          <p class="muted">Los lotes aparecerán aquí al iniciar el escaneo, la clasificación o la exportación.</p>
+      <div class="action-toolbar">
+        <div class="primary-actions">
+          <button id="btn-ai-regenerate" type="button" class="btn secondary">Regenerar nombres con IA</button>
+          <button id="btn-export" type="button" class="btn primary">Aplicar y Exportar Árbol</button>
         </div>
-      </details>
+
+        <details id="advanced-menu" class="advanced-menu">
+          <summary>Ajustes avanzados</summary>
+          <div class="advanced-body">
+            <div class="advanced-row">
+              <div class="scan-buttons">
+                <button id="btn-pause" type="button" class="btn small" disabled>Pausar</button>
+                <button id="btn-resume" type="button" class="btn small" disabled>Reanudar</button>
+                <button id="btn-ai-classify" type="button" class="btn small">Clasificar con IA</button>
+              </div>
+              <div class="batch-controls">
+                <label class="batch-size-label">
+                  Tamaño de lote
+                  <select id="batch-size">
+                    <option value="50">50</option>
+                    <option value="100" selected>100</option>
+                    <option value="250">250</option>
+                    <option value="500">500</option>
+                  </select>
+                </label>
+                <label class="checkbox-label">
+                  <input id="chk-solo-lote-adv" type="checkbox" />
+                  <span>Probar solo 1 lote</span>
+                </label>
+              </div>
+            </div>
+            <div class="advanced-row">
+              <span class="muted">Edición manual del árbol:</span>
+              <div class="folder-actions">
+                <button id="btn-rename-folder" type="button" class="btn small">Renombrar</button>
+                <button id="btn-merge-folder" type="button" class="btn small">Fusionar</button>
+                <button id="btn-create-folder" type="button" class="btn small">Nueva carpeta</button>
+              </div>
+            </div>
+            <div class="batch-summary-line muted">
+              Progreso por lotes (<span id="batch-summary-count">0 lotes</span>)
+            </div>
+            <div id="batch-list" class="batch-list"></div>
+          </div>
+        </details>
+      </div>
     </section>
 
     <main class="workspace">
       <aside class="tree-pane" role="region" aria-label="Árbol de carpetas propuesto">
         <div class="pane-header">
           <h2>Árbol Propuesto</h2>
-          <div class="folder-actions">
-            <button id="btn-rename-folder" type="button" class="btn small">Renombrar</button>
-            <button id="btn-merge-folder" type="button" class="btn small">Fusionar</button>
-            <button id="btn-create-folder" type="button" class="btn small">Nueva carpeta</button>
-          </div>
         </div>
         <ul id="folder-list" class="folder-list" role="tree" aria-label="Carpetas"></ul>
       </aside>
@@ -102,7 +131,7 @@
         <div id="items-grid" class="items-grid" role="list" aria-label="Miniaturas de elementos">
           <div class="empty-state">
             <h3>Aún no hay elementos escaneados</h3>
-            <p>Selecciona la <strong>Carpeta Origen</strong> y la <strong>Carpeta Destino</strong> arriba, y pulsa <strong>Iniciar Escaneo</strong> para previsualizar el árbol propuesto.</p>
+            <p>Selecciona tu <strong>Carpeta con fotos nuevas</strong> y <strong>Mi Biblioteca Organizada</strong> arriba, y pulsa <strong>Organizar Automáticamente</strong>.</p>
           </div>
         </div>
       </section>

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from photo_organizer.ai_classifier import DEFAULT_AGY_MODEL, classify_with_agy
 from photo_organizer.clustering import ClusterItem, cluster_and_stage_items
 from photo_organizer.config import (
     IGNORED_SIDECAR_EXTENSIONS,
@@ -21,11 +22,12 @@ from photo_organizer.config import (
     is_onedrive_placeholder,
     validate_source_dest_pair,
 )
-from photo_organizer.db import SingleWriterQueue, init_db, open_connection
+from photo_organizer.db import SingleWriterQueue, init_db, open_connection, recompute_filenames
 from photo_organizer.media import MediaMetadataService
 from photo_organizer.sidecar import build_json_index, merge_metadata, resolve_sidecar
 
 
+INDEX_FILENAME = "_cronofotos_index.json"
 VALID_BATCH_SIZES = (50, 100, 250, 500)
 DEFAULT_BATCH_SIZE = 100
 
@@ -47,6 +49,61 @@ def compute_sha256_streaming(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+def save_library_index(dest_dir: Path, index: dict[str, dict[str, Any]]) -> None:
+    """Persist _cronofotos_index.json atomically inside dest_dir."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    index_path = dest_dir / INDEX_FILENAME
+    tmp_path = dest_dir / f"{INDEX_FILENAME}.tmp"
+    tmp_path.write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp_path, index_path)
+
+
+def load_library_index(dest_dir: Path) -> dict[str, dict[str, Any]]:
+    """Load _cronofotos_index.json and index any pre-existing files in dest_dir."""
+    index: dict[str, dict[str, Any]] = {}
+    if not dest_dir.exists():
+        return index
+
+    index_path = dest_dir / INDEX_FILENAME
+    if index_path.is_file():
+        try:
+            loaded = json.loads(index_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                index = loaded
+        except (OSError, json.JSONDecodeError):
+            index = {}
+
+    known_paths = {
+        str(v.get("rel_path")): (sha, int(v.get("size_bytes", -1)))
+        for sha, v in index.items()
+        if isinstance(v, dict) and v.get("rel_path")
+    }
+    dirty = False
+    for existing in sorted(dest_dir.rglob("*")):
+        if not existing.is_file():
+            continue
+        if existing.name in {INDEX_FILENAME, f"{INDEX_FILENAME}.tmp"} or existing.suffix == ".tmp":
+            continue
+        if "_Duplicados" in existing.parts:
+            continue
+        rel = existing.relative_to(dest_dir).as_posix()
+        sz = existing.stat().st_size
+        prev = known_paths.get(rel)
+        if prev is not None and prev[1] == sz:
+            continue
+        sha = compute_sha256_streaming(existing)
+        index[sha] = {
+            "rel_path": rel,
+            "size_bytes": sz,
+            "indexed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        dirty = True
+
+    if dirty or not index_path.is_file():
+        save_library_index(dest_dir, index)
+    return index
+
+
 @dataclass
 class _DiscoveredMedia:
     """Global read-only scan entry prior to batched metadata extraction."""
@@ -58,6 +115,7 @@ class _DiscoveredMedia:
     is_placeholder: bool
     sha256: str | None = None
     is_duplicate: bool = False
+    already_in_dest: bool = False
 
 
 @dataclass
@@ -67,9 +125,12 @@ class ProgressSnapshot:
     job_id: str
     status: str
     stage: str
+    phase_label: str = "1/4 Depurando duplicados"
     total_files: int = 0
     processed_files: int = 0
+    new_count: int = 0
     duplicates_count: int = 0
+    screenshots_count: int = 0
     manual_review_count: int = 0
     items_per_sec: float = 0.0
     batch_size: int = DEFAULT_BATCH_SIZE
@@ -82,9 +143,12 @@ class ProgressSnapshot:
             "job_id": self.job_id,
             "status": self.status,
             "stage": self.stage,
+            "phase_label": self.phase_label,
             "total_files": self.total_files,
             "processed_files": self.processed_files,
+            "new_count": self.new_count,
             "duplicates_count": self.duplicates_count,
+            "screenshots_count": self.screenshots_count,
             "manual_review_count": self.manual_review_count,
             "items_per_sec": round(self.items_per_sec, 2),
             "batch_size": self.batch_size,
@@ -103,11 +167,15 @@ class PipelineOrchestrator:
         media_service: MediaMetadataService,
         max_workers: int = 4,
         on_progress: Callable[[ProgressSnapshot], None] | None = None,
+        antigravity_cli: str = "agy",
+        ai_model: str = DEFAULT_AGY_MODEL,
     ) -> None:
         self.db_path = db_path
         self.media_service = media_service
         self.max_workers = max_workers
         self.on_progress = on_progress
+        self.antigravity_cli = antigravity_cli
+        self.ai_model = ai_model
         self._pause_event = asyncio.Event()
         self._pause_event.set()
         self._last_emit_ts = 0.0
@@ -160,6 +228,7 @@ class PipelineOrchestrator:
             job_id=jid,
             status="scanning",
             stage="discovery",
+            phase_label="1/4 Depurando duplicados",
             batch_size=eff_batch_size,
             solo_primer_lote=solo_primer_lote,
         )
@@ -191,7 +260,16 @@ class PipelineOrchestrator:
 
             self._current_snapshot.total_files = len(raw_paths)
             self._current_snapshot.stage = "hashing"
+            self._current_snapshot.phase_label = "1/4 Depurando duplicados"
             self._emit(force=True)
+
+            dest_index = load_library_index(dst)
+            existing_dest_hashes = set(dest_index.keys())
+            existing_dest_sizes = {
+                int(v.get("size_bytes", -1))
+                for v in dest_index.values()
+                if isinstance(v, dict)
+            }
 
             discovered: list[_DiscoveredMedia] = []
             size_groups: dict[int, list[_DiscoveredMedia]] = {}
@@ -225,15 +303,19 @@ class PipelineOrchestrator:
             global_duplicates = 0
 
             with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-                # Only hash files that share a file size with at least one other file
+                # Hash files that share a file size with another source file OR with destination library
                 for sz, group in size_groups.items():
-                    if len(group) <= 1:
+                    if len(group) <= 1 and sz not in existing_dest_sizes:
                         continue
                     for entry in group:
                         await self._pause_event.wait()
                         sha = await loop.run_in_executor(pool, compute_sha256_streaming, entry.path)
                         entry.sha256 = sha
-                        if sha in seen_hashes:
+                        if sha in existing_dest_hashes:
+                            entry.already_in_dest = True
+                            entry.is_duplicate = True
+                            global_duplicates += 1
+                        elif sha in seen_hashes:
                             entry.is_duplicate = True
                             global_duplicates += 1
                         else:
@@ -274,6 +356,7 @@ class PipelineOrchestrator:
                     batch_info["status"] = "en_proceso"
                     batch_start = time.monotonic()
                     self._current_snapshot.stage = "metadata"
+                    self._current_snapshot.phase_label = "2/4 Clasificando fotos y capturas"
                     self._emit(force=True)
 
                     for entry in chunk:
@@ -317,6 +400,40 @@ class PipelineOrchestrator:
                             if sidecar_res.get("route") == "_Revision_Manual"
                             else None
                         )
+                        if entry.already_in_dest:
+                            writer.enqueue(
+                                """
+                                INSERT OR REPLACE INTO media_items
+                                    (id, job_id, source_path, ext, size_bytes, sha256, is_duplicate,
+                                     captured_at, latitude, longitude, sidecar_path, metadata_json,
+                                     target_folder, target_filename, route_reason, export_state)
+                                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, '_Omitidos_Ya_En_Biblioteca', ?, 'already_in_library', 'PENDING_EXPORT')
+                                """,
+                                (
+                                    item_id,
+                                    jid,
+                                    str(fpath),
+                                    ext,
+                                    entry.size_bytes,
+                                    entry.sha256,
+                                    merged.get("captured_at"),
+                                    merged.get("latitude"),
+                                    merged.get("longitude"),
+                                    sidecar_res.get("sidecar_path"),
+                                    json.dumps(merged),
+                                    f"__skipped_{item_id}{ext}",
+                                ),
+                            )
+                            processed_total += 1
+                            batch_info["processed_items"] += 1
+                            batch_info["elapsed_seconds"] = round(time.monotonic() - batch_start, 3)
+                            elapsed = max(0.001, time.monotonic() - start_ts)
+                            self._current_snapshot.processed_files = processed_total
+                            self._current_snapshot.items_per_sec = processed_total / elapsed
+                            self._emit()
+                            continue
+
+                        has_camera_exif = bool(embedded.get("make") or embedded.get("model"))
                         cluster_item = ClusterItem(
                             id=item_id,
                             source_path=str(fpath),
@@ -327,6 +444,7 @@ class PipelineOrchestrator:
                             latitude=merged.get("latitude"),
                             longitude=merged.get("longitude"),
                             route_reason=route_override,
+                            has_camera_exif=has_camera_exif,
                         )
                         cluster_inputs.append(cluster_item)
 
@@ -371,18 +489,65 @@ class PipelineOrchestrator:
 
             writer.flush()
 
-            # Stage 3: Temporal/spatial clustering + deterministic naming for processed items
+            # Stage 3: Temporal/spatial clustering + AI folder naming + deterministic naming
             self._current_snapshot.stage = "clustering"
+            self._current_snapshot.phase_label = "3/4 Nombrando carpetas con IA"
             self._emit(force=True)
             staged = cluster_and_stage_items(
                 cluster_inputs,
                 time_gap_hours=time_gap_hours,
                 gps_distance_km=gps_distance_km,
             )
+
+            # Group 01_Recuerdos/YYYY/YYYY-MM - ... folders and name them via agy / fallback
+            folder_items: dict[str, list[ClusterItem]] = {}
+            for ci in cluster_inputs:
+                tf = staged[ci.id]["target_folder"]
+                if tf.startswith("01_Recuerdos/"):
+                    folder_items.setdefault(tf, []).append(ci)
+
+            folder_renames: dict[str, str] = {}
+            for old_folder, group_items in folder_items.items():
+                parts = old_folder.split("/")
+                if len(parts) < 3:
+                    continue
+                year_part = parts[1]
+                ym_prefix = parts[2].split(" - ")[0]
+                sample = group_items[0]
+                orig_parent = Path(sample.source_path).parent.name
+                gps_txt = (
+                    f" | GPS: {sample.latitude:.2f},{sample.longitude:.2f}"
+                    if sample.latitude is not None and sample.longitude is not None
+                    else ""
+                )
+                summary = f"{ym_prefix} | {len(group_items)} fotos | carpeta: {orig_parent}{gps_txt}"
+                ai_name = classify_with_agy(
+                    summary,
+                    cli_command=self.antigravity_cli,
+                    model=self.ai_model,
+                )
+                safe_ai = "".join("_" if c in '<>:"/\\|?*' else c for c in ai_name).strip()
+                if safe_ai:
+                    folder_renames[old_folder] = f"01_Recuerdos/{year_part}/{ym_prefix} - {safe_ai}"
+
+            if folder_renames:
+                for ci in cluster_inputs:
+                    old_tf = staged[ci.id]["target_folder"]
+                    if old_tf in folder_renames:
+                        staged[ci.id]["target_folder"] = folder_renames[old_tf]
+
             manual_count = self._current_snapshot.manual_review_count
-            for item_id, info in staged.items():
-                if str(info["target_folder"]).startswith("_Revision_Manual"):
+            screenshots_count = 0
+            new_count = 0
+            for ci in cluster_inputs:
+                info = staged[ci.id]
+                tf_str = str(info["target_folder"])
+                if tf_str.startswith("_Revision_Manual"):
                     manual_count += 1
+                elif tf_str.startswith("02_Capturas_y_WhatsApp"):
+                    screenshots_count += 1
+                if not ci.is_duplicate:
+                    new_count += 1
                 writer.enqueue(
                     """
                     UPDATE media_items
@@ -394,15 +559,27 @@ class PipelineOrchestrator:
                         info["target_filename"],
                         info["location_label"],
                         info["route_reason"],
-                        item_id,
+                        ci.id,
                     ),
                 )
+            writer.flush()
+            if folder_renames:
+                conn_recomp = open_connection(self.db_path)
+                try:
+                    with conn_recomp:
+                        for new_tf in set(folder_renames.values()):
+                            recompute_filenames(conn_recomp, jid, new_tf)
+                finally:
+                    conn_recomp.close()
 
             has_pending = any(b["status"] == "pendiente" for b in self._current_snapshot.batches)
             final_status = "partial" if (solo_primer_lote and has_pending) else "completed"
             self._current_snapshot.manual_review_count = manual_count
+            self._current_snapshot.screenshots_count = screenshots_count
+            self._current_snapshot.new_count = new_count
             self._current_snapshot.status = final_status
             self._current_snapshot.stage = final_status
+            self._current_snapshot.phase_label = "4/4 Listo"
             writer.enqueue(
                 """
                 UPDATE jobs

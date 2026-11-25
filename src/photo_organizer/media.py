@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -181,6 +182,62 @@ def _parse_exif_datetime(raw: Any) -> str | None:
     return None
 
 
+_FILENAME_DATE_TIME_RE = re.compile(
+    r"(?:^|[^0-9])(19\d{2}|20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])[-_](\d{2})(\d{2})(\d{2})(?:$|[^0-9])"
+)
+_FILENAME_DATE_ONLY_RE = re.compile(
+    r"(?:^|[^0-9])(19\d{2}|20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?:$|[^0-9])"
+)
+_FFMPEG_CREATION_TIME_RE = re.compile(
+    r"creation_time\s*:\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"
+)
+
+
+def extract_date_from_filename(filename: str) -> str | None:
+    """Extract ISO-8601 UTC timestamp from common IMG/Screenshot/VID/PXL filename patterns."""
+    m_dt = _FILENAME_DATE_TIME_RE.search(filename)
+    if m_dt:
+        y, mo, d, hh, mm, ss = (int(g) for g in m_dt.groups())
+        try:
+            dt = datetime(y, mo, d, hh, mm, ss, tzinfo=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            pass
+    m_d = _FILENAME_DATE_ONLY_RE.search(filename)
+    if m_d:
+        y, mo, d = (int(g) for g in m_d.groups())
+        try:
+            dt = datetime(y, mo, d, 0, 0, 0, tzinfo=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            pass
+    return None
+
+
+def _read_video_date_ffmpeg(path: Path, ffmpeg_bin: str | None) -> str | None:
+    """Extract creation_time from video metadata via ffmpeg when available."""
+    if not ffmpeg_bin:
+        return None
+    resolved = resolve_cli_binary(ffmpeg_bin)
+    if not resolved:
+        return None
+    try:
+        proc = subprocess.run(
+            [resolved, "-i", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        output = (proc.stderr or "") + "\n" + (proc.stdout or "")
+        match = _FFMPEG_CREATION_TIME_RE.search(output)
+        if match:
+            return _parse_exif_datetime(match.group(1))
+    except Exception:
+        pass
+    return None
+
+
 def _read_metadata_python_fallback(path: Path) -> dict[str, Any]:
     """Read basic image EXIF using Pillow/piexif when ExifTool is absent."""
     result: dict[str, Any] = {
@@ -191,24 +248,28 @@ def _read_metadata_python_fallback(path: Path) -> dict[str, Any]:
         "longitude": None,
         "width": None,
         "height": None,
+        "make": None,
+        "model": None,
     }
-    if Image is None or path.suffix.lower() in VIDEO_EXTENSIONS:
-        return result
-
-    try:
-        with Image.open(path) as img:
-            result["width"], result["height"] = img.size
-            exif = img.getexif()
-            if exif and ExifTags is not None:
-                tag_map = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
-                for dt_key in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
-                    if dt_key in tag_map:
-                        parsed = _parse_exif_datetime(str(tag_map[dt_key]))
-                        if parsed:
-                            result["captured_at"] = parsed
-                            break
-    except Exception:
-        pass
+    if Image is not None and path.suffix.lower() not in VIDEO_EXTENSIONS:
+        try:
+            with Image.open(path) as img:
+                result["width"], result["height"] = img.size
+                exif = img.getexif()
+                if exif and ExifTags is not None:
+                    tag_map = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
+                    result["make"] = tag_map.get("Make")
+                    result["model"] = tag_map.get("Model")
+                    for dt_key in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+                        if dt_key in tag_map:
+                            parsed = _parse_exif_datetime(str(tag_map[dt_key]))
+                            if parsed:
+                                result["captured_at"] = parsed
+                                break
+        except Exception:
+            pass
+    if not result["captured_at"]:
+        result["captured_at"] = extract_date_from_filename(path.name)
     return result
 
 
@@ -258,6 +319,10 @@ class MediaMetadataService:
                         break
                 lat = raw.get("GPSLatitude")
                 lon = raw.get("GPSLongitude")
+                if not captured_at and path.suffix.lower() in VIDEO_EXTENSIONS:
+                    captured_at = _read_video_date_ffmpeg(path, self.ffmpeg_bin)
+                if not captured_at:
+                    captured_at = extract_date_from_filename(path.name)
                 return {
                     "SourceFile": str(path),
                     "Extractor": "exiftool",
@@ -273,7 +338,12 @@ class MediaMetadataService:
                 self.exiftool_bin = None
             except Exception:
                 pass
-        return _read_metadata_python_fallback(path)
+        fallback = _read_metadata_python_fallback(path)
+        if path.suffix.lower() in VIDEO_EXTENSIONS and self.ffmpeg_bin:
+            ff_dt = _read_video_date_ffmpeg(path, self.ffmpeg_bin)
+            if ff_dt:
+                fallback["captured_at"] = ff_dt
+        return fallback
 
     def embed_metadata(self, dest_path: Path, metadata: dict[str, Any]) -> bool:
         """Embed merged captured_at / GPS metadata into the destination copy only."""

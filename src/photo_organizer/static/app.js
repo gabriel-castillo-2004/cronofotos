@@ -10,6 +10,16 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
+const PHASE_MAP = {
+  init: "1/4 Depurando duplicados",
+  discovery: "1/4 Depurando duplicados",
+  hashing: "1/4 Depurando duplicados",
+  metadata: "2/4 Clasificando fotos y capturas",
+  clustering: "3/4 Nombrando carpetas con IA",
+  completed: "4/4 Listo",
+  partial: "4/4 Listo",
+};
+
 async function api(path, method = "GET", body = null) {
   const opts = { method, headers: {} };
   if (body !== null) {
@@ -40,10 +50,12 @@ async function refreshHealth() {
 
 function getBatchOptions() {
   const sizeEl = $("batch-size");
-  const soloEl = $("solo-primer-lote");
+  const soloMain = $("solo-primer-lote");
+  const soloAdv = $("chk-solo-lote-adv");
+  const solo = Boolean((soloMain && soloMain.checked) || (soloAdv && soloAdv.checked));
   return {
     batch_size: sizeEl ? Number(sizeEl.value || 100) : 100,
-    solo_primer_lote: soloEl ? Boolean(soloEl.checked) : false,
+    solo_primer_lote: solo,
   };
 }
 
@@ -57,10 +69,6 @@ function renderBatches(batches) {
   listEl.innerHTML = "";
 
   if (items.length === 0) {
-    const p = document.createElement("p");
-    p.className = "muted";
-    p.textContent = "Los lotes aparecerán aquí al iniciar el escaneo, la clasificación o la exportación.";
-    listEl.appendChild(p);
     return;
   }
 
@@ -122,14 +130,29 @@ function renderBatches(batches) {
 
 function updateProgressUI(snap) {
   if (snap.job_id) state.jobId = snap.job_id;
-  $("progress-stage").textContent = `Estado: ${snap.status} (${snap.stage})`;
+  const phaseLabel = snap.phase_label || PHASE_MAP[snap.stage] || "1/4 Depurando duplicados";
+  if ($("progress-phase")) $("progress-phase").textContent = phaseLabel;
+  $("progress-stage").textContent = `Estado: ${snap.status}`;
   $("progress-stats").textContent =
-    `${snap.processed_files} / ${snap.total_files} archivos · ${snap.items_per_sec} items/s · ${snap.duplicates_count} dup`;
-  const pct = snap.total_files > 0 ? Math.round((snap.processed_files / snap.total_files) * 100) : 0;
-  $("progress-bar").value = pct;
+    `${snap.processed_files} / ${snap.total_files} archivos · ${snap.items_per_sec} items/s`;
 
-  $("btn-pause").disabled = snap.status !== "scanning";
-  $("btn-resume").disabled = snap.status !== "paused";
+  const pct = snap.total_files > 0 ? Math.round((snap.processed_files / snap.total_files) * 100) : 0;
+  $("progress-bar").value = snap.status === "completed" ? 100 : pct;
+
+  const newCount = snap.new_count ?? Math.max(0, (snap.processed_files || 0) - (snap.duplicates_count || 0));
+  if ($("cnt-new")) $("cnt-new").textContent = String(newCount);
+  if ($("cnt-dups")) $("cnt-dups").textContent = String(snap.duplicates_count || 0);
+  if ($("cnt-screenshots")) $("cnt-screenshots").textContent = String(snap.screenshots_count || 0);
+
+  const activePhaseNum = Number(phaseLabel[0]) || 1;
+  document.querySelectorAll(".phase-step").forEach((el) => {
+    const pNum = Number(el.getAttribute("data-phase") || 0);
+    el.classList.toggle("active", pNum === activePhaseNum);
+    el.classList.toggle("done", pNum < activePhaseNum || snap.status === "completed");
+  });
+
+  if ($("btn-pause")) $("btn-pause").disabled = snap.status !== "scanning";
+  if ($("btn-resume")) $("btn-resume").disabled = snap.status !== "paused";
 
   if (Array.isArray(snap.batches) && snap.batches.length > 0) {
     renderBatches(snap.batches);
@@ -206,7 +229,7 @@ async function loadTree() {
     const p = document.createElement("p");
     p.textContent = state.jobId
       ? "Selecciona otra carpeta en el árbol izquierdo para ver sus elementos."
-      : "Selecciona la Carpeta Origen y la Carpeta Destino arriba, y pulsa Iniciar Escaneo para previsualizar el árbol propuesto.";
+      : "Selecciona tu Carpeta con fotos nuevas y Mi Biblioteca Organizada arriba, y pulsa Organizar Automáticamente.";
     empty.appendChild(h3);
     empty.appendChild(p);
     grid.appendChild(empty);
@@ -290,6 +313,16 @@ function bindEvents() {
     };
   }
 
+  const syncChecks = (src, dst) => {
+    if (src && dst) {
+      src.onchange = () => {
+        dst.checked = src.checked;
+      };
+    }
+  };
+  syncChecks($("solo-primer-lote"), $("chk-solo-lote-adv"));
+  syncChecks($("chk-solo-lote-adv"), $("solo-primer-lote"));
+
   const browseFolder = async (inputId) => {
     const input = $(inputId);
     const res = await api("/api/browse-folder", "POST", {
@@ -310,7 +343,9 @@ function bindEvents() {
   $("btn-start").onclick = async () => {
     const source_dir = $("source-dir").value.trim();
     const dest_dir = $("dest-dir").value.trim();
-    if (!source_dir || !dest_dir) return alert("Indica carpeta origen y destino.");
+    if (!source_dir || !dest_dir) {
+      return alert("Indica tu Carpeta con fotos nuevas y Mi Biblioteca Organizada.");
+    }
     const { batch_size, solo_primer_lote } = getBatchOptions();
     const snap = await api("/api/scan/start", "POST", {
       source_dir,
@@ -322,8 +357,12 @@ function bindEvents() {
     connectSSE();
   };
 
-  $("btn-pause").onclick = async () => updateProgressUI(await api("/api/scan/pause", "POST", {}));
-  $("btn-resume").onclick = async () => updateProgressUI(await api("/api/scan/resume", "POST", {}));
+  if ($("btn-pause")) {
+    $("btn-pause").onclick = async () => updateProgressUI(await api("/api/scan/pause", "POST", {}));
+  }
+  if ($("btn-resume")) {
+    $("btn-resume").onclick = async () => updateProgressUI(await api("/api/scan/resume", "POST", {}));
+  }
 
   $("btn-prev-page").onclick = () => {
     if (state.page > 1) {
@@ -366,7 +405,7 @@ function bindEvents() {
 
   $("btn-create-folder").onclick = async () => {
     if (!state.jobId) return;
-    const folder = prompt("Nombre de la nueva carpeta:", "2024/2024-01 - Nuevo");
+    const folder = prompt("Nombre de la nueva carpeta:", "01_Recuerdos/2024/2024-01 - Nuevo");
     if (!folder) return;
     await api("/api/tree/folders/create", "POST", { job_id: state.jobId, folder });
     await loadTree();
@@ -395,21 +434,31 @@ function bindEvents() {
     await refreshHealth();
   };
 
-  $("btn-ai-classify").onclick = async () => {
-    if (!state.jobId || state.items.length === 0) return;
-    const ids = state.items.map((it) => it.id);
-    const { batch_size, solo_primer_lote } = getBatchOptions();
-    const preview = await api("/api/ai/classify", "POST", {
-      job_id: state.jobId,
-      item_ids: ids,
-      confirmed: false,
-      batch_size,
-      solo_primer_lote,
-    });
-    $("ai-confirm-text").textContent =
-      `Se enviarán ${preview.item_count} elementos en lotes de ${batch_size} al modelo ${preview.model}. ¿Continuar?`;
-    $("ai-confirm-modal").showModal();
-  };
+  if ($("btn-ai-regenerate")) {
+    $("btn-ai-regenerate").onclick = async () => {
+      if (!state.jobId) return alert("Primero ejecuta Organizar Automáticamente.");
+      await api("/api/ai/regenerate", "POST", { job_id: state.jobId });
+      await loadTree();
+    };
+  }
+
+  if ($("btn-ai-classify")) {
+    $("btn-ai-classify").onclick = async () => {
+      if (!state.jobId || state.items.length === 0) return;
+      const ids = state.items.map((it) => it.id);
+      const { batch_size, solo_primer_lote } = getBatchOptions();
+      const preview = await api("/api/ai/classify", "POST", {
+        job_id: state.jobId,
+        item_ids: ids,
+        confirmed: false,
+        batch_size,
+        solo_primer_lote,
+      });
+      $("ai-confirm-text").textContent =
+        `Se enviarán ${preview.item_count} elementos en lotes de ${batch_size} al modelo ${preview.model}. ¿Continuar?`;
+      $("ai-confirm-modal").showModal();
+    };
+  }
 
   $("btn-ai-cancel").onclick = () => $("ai-confirm-modal").close();
   $("btn-ai-confirm").onclick = async () => {
@@ -430,7 +479,7 @@ function bindEvents() {
   };
 
   $("btn-export").onclick = async () => {
-    if (!state.jobId) return alert("Primero ejecuta un escaneo.");
+    if (!state.jobId) return alert("Primero ejecuta Organizar Automáticamente.");
     if (!confirm("¿Aplicar y Exportar Árbol al directorio destino?")) return;
     const { batch_size, solo_primer_lote } = getBatchOptions();
     const res = await api("/api/export", "POST", {

@@ -13,7 +13,7 @@ from typing import Any, Callable
 from photo_organizer.config import IGNORED_SIDECAR_EXTENSIONS, to_win_long_path
 from photo_organizer.db import open_connection
 from photo_organizer.media import MediaMetadataService
-from photo_organizer.worker import compute_sha256_streaming
+from photo_organizer.worker import compute_sha256_streaming, load_library_index, save_library_index
 
 
 def cleanup_orphaned_tmp_files(dest_dir: Path) -> int:
@@ -46,6 +46,7 @@ def run_two_phase_export(
     """Export staged media_items sequentially in batches without mutating source files."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     cleaned = cleanup_orphaned_tmp_files(dest_dir)
+    lib_index = load_library_index(dest_dir)
 
     eff_batch_size = batch_size if batch_size and batch_size > 0 else 100
     conn = open_connection(db_path)
@@ -59,7 +60,7 @@ def run_two_phase_export(
         rows = conn.execute(
             """
             SELECT id, source_path, ext, sha256, is_duplicate, is_placeholder,
-                   target_folder, target_filename, metadata_json, export_state
+                   target_folder, target_filename, metadata_json, export_state, route_reason
             FROM media_items
             WHERE job_id = ?
             ORDER BY target_folder ASC, target_filename ASC
@@ -92,6 +93,7 @@ def run_two_phase_export(
             # Skip already completed batches when resuming/continuing
             if all(
                 r["export_state"] == "VERIFIED"
+                or r["route_reason"] == "already_in_library"
                 or r["is_placeholder"]
                 or str(r["ext"]).lower() in IGNORED_SIDECAR_EXTENSIONS
                 for r in chunk
@@ -114,7 +116,7 @@ def run_two_phase_export(
                 if pause_event is not None:
                     pause_event.wait()
 
-                if row["export_state"] == "VERIFIED":
+                if row["export_state"] == "VERIFIED" or row["route_reason"] == "already_in_library":
                     skipped += 1
                     batch_info["processed_items"] += 1
                     continue
@@ -202,6 +204,11 @@ def run_two_phase_export(
                 if row["is_duplicate"]:
                     duplicates += 1
                     batch_info["duplicates_skipped"] += 1
+                else:
+                    lib_index[expected_sha] = {
+                        "rel_path": f"{row['target_folder']}/{row['target_filename']}",
+                        "size_bytes": final_path.stat().st_size if final_path.exists() else 0,
+                    }
 
             batch_info["elapsed_seconds"] = round(time.monotonic() - t0, 3)
             batch_info["status"] = "error" if (batch_errors > 0 and batch_exported == 0) else "completado"
@@ -212,6 +219,10 @@ def run_two_phase_export(
                 break
     finally:
         conn.close()
+        try:
+            save_library_index(dest_dir, lib_index)
+        except OSError:
+            pass
 
     return {
         "exported": exported,

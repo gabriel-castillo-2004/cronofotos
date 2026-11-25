@@ -13,9 +13,10 @@ from photo_organizer.config import VIDEO_EXTENSIONS, resolve_cli_binary
 _ORIG_SUBPROCESS_RUN = subprocess.run
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except ImportError:  # pragma: no cover
     Image = None  # type: ignore[assignment]
+    ImageOps = None  # type: ignore[assignment]
 
 try:
     import pillow_heif  # type: ignore[import-not-found]
@@ -82,6 +83,8 @@ class ThumbnailCache:
             return b"THUMB:" + source_path.read_bytes()[:64]
         try:
             with Image.open(source_path) as img:
+                if ImageOps is not None:
+                    img = ImageOps.exif_transpose(img)
                 img = img.convert("RGB")
                 img.thumbnail(self.thumb_size)
                 buf = io.BytesIO()

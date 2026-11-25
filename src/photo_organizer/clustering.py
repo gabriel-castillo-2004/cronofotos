@@ -14,7 +14,8 @@ try:  # Optional offline reverse_geocoder
 except ImportError:  # pragma: no cover
     _rg = None
 
-SCREENSHOT_RE = re.compile(r"(screenshot|captura|screen[-_\s]?shot|img[-_]?e\d+)", re.IGNORECASE)
+SCREENSHOT_RE = re.compile(r"(screenshot|captura|pantallazo|screen[-_\s]?shot|img[-_]?e\d+)", re.IGNORECASE)
+WHATSAPP_RE = re.compile(r"(whatsapp|img-\d{8}-wa\d+|vid-\d{8}-wa\d+|[-_]wa\d{3,})", re.IGNORECASE)
 DOCUMENT_RE = re.compile(r"(scan|receipt|factura|ticket|documento|doc[-_]\d+)", re.IGNORECASE)
 
 
@@ -47,9 +48,11 @@ def offline_reverse_geocode(lat: float | None, lon: float | None) -> str | None:
 
 
 def is_screenshot_or_document(filename: str) -> str | None:
-    """Detect screenshots or documents by filename heuristics."""
+    """Detect screenshots, WhatsApp forwards, or documents by filename heuristics."""
     if SCREENSHOT_RE.search(filename):
         return "Capturas"
+    if WHATSAPP_RE.search(filename):
+        return "WhatsApp"
     if DOCUMENT_RE.search(filename):
         return "Documentos"
     return None
@@ -67,6 +70,7 @@ class ClusterItem:
     longitude: float | None
     route_reason: str | None = None
     ai_label: str | None = None
+    has_camera_exif: bool = False
 
 
 def _parse_dt(iso_str: str | None) -> datetime | None:
@@ -106,15 +110,23 @@ def cluster_and_stage_items(
             continue
 
         special = is_screenshot_or_document(fname)
-        if special:
+        dt = _parse_dt(item.captured_at)
+        if special in ("Capturas", "WhatsApp") and not item.has_camera_exif:
+            ym_folder = dt.strftime("%Y-%m") if dt else "Sin_Fecha"
             staged[item.id] = {
-                "target_folder": f"_Revision_Manual/{special}",
+                "target_folder": f"02_Capturas_y_WhatsApp/{ym_folder}",
                 "location_label": None,
                 "route_reason": f"classified_{special.lower()}",
             }
             continue
+        if special == "Documentos":
+            staged[item.id] = {
+                "target_folder": "_Revision_Manual/Documentos",
+                "location_label": None,
+                "route_reason": "classified_documentos",
+            }
+            continue
 
-        dt = _parse_dt(item.captured_at)
         if dt is None:
             staged[item.id] = {
                 "target_folder": "_Revision_Manual",
@@ -158,7 +170,7 @@ def cluster_and_stage_items(
         ym = dt.strftime("%Y-%m")
         event_name = item.ai_label or cluster_location or f"Evento {cluster_idx:03d}"
         safe_event = re.sub(r'[<>:"/\\|?*]', "_", event_name).strip()
-        target_folder = f"{year}/{ym} - {safe_event}"
+        target_folder = f"01_Recuerdos/{year}/{ym} - {safe_event}"
 
         staged[item.id] = {
             "target_folder": target_folder,
