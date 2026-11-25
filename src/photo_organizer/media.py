@@ -191,6 +191,25 @@ _FILENAME_DATE_ONLY_RE = re.compile(
 _FFMPEG_CREATION_TIME_RE = re.compile(
     r"creation_time\s*:\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"
 )
+_FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
+def _parse_duration_sec(raw: Any) -> float | None:
+    if isinstance(raw, (int, float)):
+        return float(raw) if raw >= 0 else None
+    if isinstance(raw, str):
+        s = raw.strip().lower().rstrip("s")
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        parts = s.split(":")
+        if len(parts) == 3:
+            try:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            except ValueError:
+                return None
+    return None
 
 
 def extract_date_from_filename(filename: str) -> str | None:
@@ -214,13 +233,13 @@ def extract_date_from_filename(filename: str) -> str | None:
     return None
 
 
-def _read_video_date_ffmpeg(path: Path, ffmpeg_bin: str | None) -> str | None:
-    """Extract creation_time from video metadata via ffmpeg when available."""
+def _read_video_info_ffmpeg(path: Path, ffmpeg_bin: str | None) -> tuple[str | None, float | None]:
+    """Extract creation_time and duration_sec from video metadata via ffmpeg when available."""
     if not ffmpeg_bin:
-        return None
+        return None, None
     resolved = resolve_cli_binary(ffmpeg_bin)
     if not resolved:
-        return None
+        return None, None
     try:
         proc = subprocess.run(
             [resolved, "-i", str(path)],
@@ -230,12 +249,24 @@ def _read_video_date_ffmpeg(path: Path, ffmpeg_bin: str | None) -> str | None:
             check=False,
         )
         output = (proc.stderr or "") + "\n" + (proc.stdout or "")
+        dt_val = None
         match = _FFMPEG_CREATION_TIME_RE.search(output)
         if match:
-            return _parse_exif_datetime(match.group(1))
+            dt_val = _parse_exif_datetime(match.group(1))
+        dur_val = None
+        dur_m = _FFMPEG_DURATION_RE.search(output)
+        if dur_m:
+            h, m, s = int(dur_m.group(1)), int(dur_m.group(2)), float(dur_m.group(3))
+            dur_val = h * 3600 + m * 60 + s
+        return dt_val, dur_val
     except Exception:
         pass
-    return None
+    return None, None
+
+
+def _read_video_date_ffmpeg(path: Path, ffmpeg_bin: str | None) -> str | None:
+    dt_val, _ = _read_video_info_ffmpeg(path, ffmpeg_bin)
+    return dt_val
 
 
 def _read_metadata_python_fallback(path: Path) -> dict[str, Any]:
@@ -250,6 +281,7 @@ def _read_metadata_python_fallback(path: Path) -> dict[str, Any]:
         "height": None,
         "make": None,
         "model": None,
+        "duration_sec": None,
     }
     if Image is not None and path.suffix.lower() not in VIDEO_EXTENSIONS:
         try:
@@ -319,8 +351,13 @@ class MediaMetadataService:
                         break
                 lat = raw.get("GPSLatitude")
                 lon = raw.get("GPSLongitude")
-                if not captured_at and path.suffix.lower() in VIDEO_EXTENSIONS:
-                    captured_at = _read_video_date_ffmpeg(path, self.ffmpeg_bin)
+                duration_sec = _parse_duration_sec(raw.get("Duration"))
+                if path.suffix.lower() in VIDEO_EXTENSIONS and (not captured_at or duration_sec is None):
+                    ff_dt, ff_dur = _read_video_info_ffmpeg(path, self.ffmpeg_bin)
+                    if not captured_at and ff_dt:
+                        captured_at = ff_dt
+                    if duration_sec is None and ff_dur is not None:
+                        duration_sec = ff_dur
                 if not captured_at:
                     captured_at = extract_date_from_filename(path.name)
                 return {
@@ -333,6 +370,7 @@ class MediaMetadataService:
                     "height": raw.get("ImageHeight"),
                     "make": raw.get("Make"),
                     "model": raw.get("Model"),
+                    "duration_sec": duration_sec,
                 }
             except FileNotFoundError:
                 self.exiftool_bin = None
@@ -340,9 +378,11 @@ class MediaMetadataService:
                 pass
         fallback = _read_metadata_python_fallback(path)
         if path.suffix.lower() in VIDEO_EXTENSIONS and self.ffmpeg_bin:
-            ff_dt = _read_video_date_ffmpeg(path, self.ffmpeg_bin)
+            ff_dt, ff_dur = _read_video_info_ffmpeg(path, self.ffmpeg_bin)
             if ff_dt:
                 fallback["captured_at"] = ff_dt
+            if ff_dur is not None:
+                fallback["duration_sec"] = ff_dur
         return fallback
 
     def embed_metadata(self, dest_path: Path, metadata: dict[str, Any]) -> bool:

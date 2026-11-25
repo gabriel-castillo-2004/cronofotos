@@ -66,10 +66,25 @@
       <div class="action-toolbar">
         <div class="primary-actions">
           <button id="btn-ai-regenerate" type="button" class="btn secondary">Regenerar nombres con IA</button>
+          <button id="btn-ai-optimize" type="button" class="btn secondary">✨ Optimizar Árbol con IA</button>
           <button id="btn-ai-cancel-run" type="button" class="btn small hidden">Cancelar IA</button>
           <button id="btn-export" type="button" class="btn primary">Aplicar y Exportar Árbol</button>
           <button id="btn-open-dest" type="button" class="btn secondary hidden">Abrir carpeta destino</button>
         </div>
+
+        <section id="ai-optimizer-panel" class="ai-optimizer-panel hidden" aria-label="Optimizar Árbol con IA">
+          <div class="ai-optimizer-header">
+            <div>
+              <strong>✨ Optimizar Árbol con IA (Análisis Visual y Estructural)</strong>
+              <span id="ai-optimizer-engine" class="badge muted-badge"></span>
+            </div>
+            <div class="ai-optimizer-actions">
+              <button id="btn-ai-apply-suggestions" type="button" class="btn primary small">Aplicar sugerencias seleccionadas</button>
+              <button id="btn-ai-close-panel" type="button" class="btn small">Cerrar</button>
+            </div>
+          </div>
+          <div id="ai-suggestions-list" class="ai-suggestions-list"></div>
+        </section>
 
         <details id="advanced-menu" class="advanced-menu">
           <summary>Ajustes avanzados</summary>

@@ -451,6 +451,8 @@ class PipelineOrchestrator:
                             longitude=merged.get("longitude"),
                             route_reason=route_override,
                             has_camera_exif=has_camera_exif,
+                            file_size=entry.size_bytes,
+                            duration_sec=embedded.get("duration_sec"),
                         )
                         cluster_inputs.append(cluster_item)
 
@@ -509,7 +511,8 @@ class PipelineOrchestrator:
             folder_items: dict[str, list[ClusterItem]] = {}
             for ci in cluster_inputs:
                 tf = staged[ci.id]["target_folder"]
-                if tf.startswith("01_Recuerdos/"):
+                rr = staged[ci.id].get("route_reason")
+                if tf.startswith("01_Recuerdos/") and rr not in ("multiday_trip", "momentos_varios"):
                     folder_items.setdefault(tf, []).append(ci)
 
             folder_renames: dict[str, str] = {}

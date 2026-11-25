@@ -84,7 +84,7 @@ function showToast(message, variant = "ok") {
 }
 
 function setActionBusy(activeBtnId, busyText) {
-  const actionIds = ["btn-start", "btn-ai-regenerate", "btn-export"];
+  const actionIds = ["btn-start", "btn-ai-regenerate", "btn-ai-optimize", "btn-export"];
   const originals = {};
   for (const id of actionIds) {
     const el = $(id);
@@ -618,6 +618,115 @@ function bindEvents() {
       } finally {
         if ($("btn-ai-cancel-run")) $("btn-ai-cancel-run").classList.add("hidden");
         restore();
+      }
+    };
+  }
+
+  let currentAiSuggestions = [];
+
+  function renderAiSuggestions(suggestions, engine) {
+    const panel = $("ai-optimizer-panel");
+    const list = $("ai-suggestions-list");
+    const engineEl = $("ai-optimizer-engine");
+    if (!panel || !list) return;
+    currentAiSuggestions = Array.isArray(suggestions) ? suggestions : [];
+    if (engineEl) {
+      engineEl.textContent = engine ? `Motor: ${engine}` : "";
+    }
+    list.innerHTML = "";
+    if (currentAiSuggestions.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "muted";
+      empty.textContent = "No se detectaron cambios estructurales necesarios en el árbol actual.";
+      list.appendChild(empty);
+    } else {
+      currentAiSuggestions.forEach((s, idx) => {
+        const row = document.createElement("label");
+        row.className = "ai-suggestion-item";
+        const chk = document.createElement("input");
+        chk.type = "checkbox";
+        chk.checked = true;
+        chk.dataset.idx = String(idx);
+
+        const body = document.createElement("div");
+        body.className = "ai-suggestion-body";
+        const beforeTxt = Array.isArray(s.before) ? s.before.join(" + ") : String(s.before || "");
+        const afterTxt = Array.isArray(s.after) ? s.after.join(" | ") : String(s.after || "");
+        const title = document.createElement("div");
+        title.className = "ai-suggestion-diff";
+        title.textContent = `[${String(s.type || "").toUpperCase()}] ${beforeTxt} -> ${afterTxt}`;
+        const reason = document.createElement("div");
+        reason.className = "ai-suggestion-reason muted";
+        reason.textContent = s.reason || "";
+        body.append(title, reason);
+
+        row.append(chk, body);
+        list.appendChild(row);
+      });
+    }
+    panel.classList.remove("hidden");
+  }
+
+  if ($("btn-ai-close-panel")) {
+    $("btn-ai-close-panel").onclick = () => {
+      if ($("ai-optimizer-panel")) $("ai-optimizer-panel").classList.add("hidden");
+    };
+  }
+
+  if ($("btn-ai-optimize")) {
+    $("btn-ai-optimize").onclick = async () => {
+      if (!state.jobId) return showToast("Primero ejecuta Organizar Automáticamente.", "warn");
+      const restore = setActionBusy("btn-ai-optimize", "Analizando árbol con IA...");
+      $("progress-stage").textContent = "Estado: Analizando árbol con IA...";
+      logActivity("Analizando estructura y miniaturas con IA...");
+      try {
+        const res = await api("/api/tree/ai-suggestions", "POST", { job_id: state.jobId });
+        renderAiSuggestions(res.suggestions || [], res.engine || "Fallback local");
+        const count = (res.suggestions || []).length;
+        const msg = `Análisis completado (${count} sugerencias · ${res.engine || "Fallback local"}).`;
+        $("progress-stage").textContent = `Estado: ${msg}`;
+        showToast(msg, "ok");
+        logActivity(msg);
+      } catch (err) {
+        showToast(`Error al analizar árbol: ${err.message}`, "warn");
+        logActivity(`Error al analizar árbol: ${err.message}`);
+      } finally {
+        restore();
+      }
+    };
+  }
+
+  if ($("btn-ai-apply-suggestions")) {
+    $("btn-ai-apply-suggestions").onclick = async () => {
+      if (!state.jobId) return;
+      const list = $("ai-suggestions-list");
+      const selected = [];
+      if (list) {
+        for (const chk of list.querySelectorAll('input[type="checkbox"]:checked')) {
+          const idx = Number(chk.dataset.idx);
+          if (!Number.isNaN(idx) && currentAiSuggestions[idx]) {
+            selected.push(currentAiSuggestions[idx]);
+          }
+        }
+      }
+      if (selected.length === 0) {
+        return showToast("Selecciona al menos una sugerencia.", "warn");
+      }
+      const btn = $("btn-ai-apply-suggestions");
+      btn.disabled = true;
+      try {
+        const res = await api("/api/tree/apply-suggestions", "POST", {
+          job_id: state.jobId,
+          suggestions: selected,
+        });
+        showToast(`Aplicadas ${res.applied || selected.length} sugerencias al árbol.`, "ok");
+        logActivity(`Sugerencias aplicadas: ${res.applied || selected.length}`);
+        if ($("ai-optimizer-panel")) $("ai-optimizer-panel").classList.add("hidden");
+        await loadTree();
+      } catch (err) {
+        showToast(`Error al aplicar sugerencias: ${err.message}`, "warn");
+      } finally {
+        btn.disabled = false;
       }
     };
   }

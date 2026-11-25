@@ -694,6 +694,57 @@ progress {
   gap: 0.25rem;
 }
 
+.ai-optimizer-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem 1rem;
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.ai-optimizer-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ai-optimizer-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.ai-suggestions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.ai-suggestion-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.ai-suggestion-diff {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.ai-suggestion-reason {
+  font-size: 0.78rem;
+}
+
 @media (max-width: 480px) {
   .controls-panel,
   .topbar {
