@@ -762,3 +762,18 @@ progress {
     width: calc(100vw - 2rem);
   }
 }
+
+.items-title-group {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ai-suggestion-thumb {
+  width: 52px;
+  height: 52px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}

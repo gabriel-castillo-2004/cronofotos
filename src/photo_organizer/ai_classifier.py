@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -438,27 +439,40 @@ class GeminiClassifier:
 
 
 _FORBIDDEN_TEMPLATE_TOKENS = ("__", "placeholder", "sample")
+_FORBIDDEN_FIXED_LABELS = ("sesión mañana", "sesión tarde", "sesion manana", "sesion tarde")
 
 
-def _is_clean_suggestion_text(val: Any) -> bool:
+def _is_clean_suggestion_text(val: Any, *, forbid_fixed_labels: bool = False) -> bool:
     if not isinstance(val, str) or not val.strip():
         return False
     low = val.lower()
-    return not any(tok in low for tok in _FORBIDDEN_TEMPLATE_TOKENS)
+    if any(tok in low for tok in _FORBIDDEN_TEMPLATE_TOKENS):
+        return False
+    if forbid_fixed_labels and any(lbl in low for lbl in _FORBIDDEN_FIXED_LABELS):
+        return False
+    return True
 
 
-def _sanitize_suggestion(raw: dict[str, Any], folder_meta: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+def _sanitize_suggestion(
+    raw: dict[str, Any],
+    folder_meta: dict[str, dict[str, Any]],
+    *,
+    forbid_fixed_labels: bool = False,
+) -> dict[str, Any] | None:
     stype = str(raw.get("type", "")).strip().lower()
     if stype not in {"rename", "merge", "split"}:
         return None
     reason = str(raw.get("reason", "")).strip() or "Optimización estructural sugerida"
-    if not _is_clean_suggestion_text(reason):
+    if not _is_clean_suggestion_text(reason, forbid_fixed_labels=forbid_fixed_labels):
         return None
 
     if stype == "rename":
         before = raw.get("before")
         after = raw.get("after")
-        if not (_is_clean_suggestion_text(before) and _is_clean_suggestion_text(after)):
+        if not (
+            _is_clean_suggestion_text(before, forbid_fixed_labels=forbid_fixed_labels)
+            and _is_clean_suggestion_text(after, forbid_fixed_labels=forbid_fixed_labels)
+        ):
             return None
         if before == after:
             return None
@@ -469,7 +483,7 @@ def _sanitize_suggestion(raw: dict[str, Any], folder_meta: dict[str, dict[str, A
         after = raw.get("after")
         if not isinstance(before, list) or len(before) < 2:
             return None
-        if not all(_is_clean_suggestion_text(b) for b in before) or not _is_clean_suggestion_text(after):
+        if not all(_is_clean_suggestion_text(b, forbid_fixed_labels=forbid_fixed_labels) for b in before) or not _is_clean_suggestion_text(after, forbid_fixed_labels=forbid_fixed_labels):
             return None
         return {
             "type": "merge",
@@ -481,12 +495,14 @@ def _sanitize_suggestion(raw: dict[str, Any], folder_meta: dict[str, dict[str, A
     # stype == "split"
     before = raw.get("before")
     after = raw.get("after")
-    if not _is_clean_suggestion_text(before) or not isinstance(after, list) or len(after) < 2:
+    if not _is_clean_suggestion_text(before, forbid_fixed_labels=forbid_fixed_labels) or not isinstance(after, list) or len(after) < 2:
         return None
-    if not all(_is_clean_suggestion_text(a) for a in after):
+    if not all(_is_clean_suggestion_text(a, forbid_fixed_labels=forbid_fixed_labels) for a in after):
         return None
     meta = folder_meta.get(str(before).strip())
     if meta is not None:
+        if meta.get("is_midnight_merged"):
+            return None
         if int(meta.get("count", 0)) <= 25 or float(meta.get("max_gap_hours", 0.0)) < 3.0:
             return None
     return {
@@ -497,7 +513,12 @@ def _sanitize_suggestion(raw: dict[str, Any], folder_meta: dict[str, dict[str, A
     }
 
 
-def _parse_suggestions_json(stdout: str, folder_meta: dict[str, dict[str, Any]]) -> list[dict[str, Any]] | None:
+def _parse_suggestions_json(
+    stdout: str,
+    folder_meta: dict[str, dict[str, Any]],
+    *,
+    forbid_fixed_labels: bool = False,
+) -> list[dict[str, Any]] | None:
     text = (stdout or "").strip()
     if not text:
         return None
@@ -515,7 +536,7 @@ def _parse_suggestions_json(stdout: str, folder_meta: dict[str, dict[str, Any]])
                 cleaned: list[dict[str, Any]] = []
                 for item in parsed["suggestions"]:
                     if isinstance(item, dict):
-                        s = _sanitize_suggestion(item, folder_meta)
+                        s = _sanitize_suggestion(item, folder_meta, forbid_fixed_labels=forbid_fixed_labels)
                         if s is not None:
                             cleaned.append(s)
                 return cleaned
@@ -534,13 +555,13 @@ def _deterministic_tree_suggestions(folder_summaries: list[dict[str, Any]]) -> l
         gap = float(f.get("max_gap_hours", 0.0))
         loc = str(f.get("location_label") or "").strip()
 
-        if cnt > 25 and gap >= 3.0:
+        if cnt > 25 and gap >= 3.0 and not f.get("is_midnight_merged"):
             base = folder.split(" - ")[0] if " - " in folder else folder
             suggestions.append(
                 {
                     "type": "split",
                     "before": folder,
-                    "after": [f"{base} - Sesión Mañana", f"{base} - Sesión Tarde"],
+                    "after": [f"{base} - Primera Parte", f"{base} - Segunda Parte"],
                     "reason": "Carpeta con más de 25 archivos y salto temporal interno >= 3 horas",
                 }
             )
@@ -592,8 +613,9 @@ def suggest_tree_optimizations(
     *,
     cli_command: str = "agy",
     model: str = DEFAULT_AGY_MODEL,
-    timeout: float = 20.0,
+    timeout: float = 60.0,
     cancel_event: threading.Event | None = None,
+    forbid_fixed_labels: bool = False,
 ) -> dict[str, Any]:
     """Analyze folder metadata + <=256px representative thumbnails in batches of <=12 via agy."""
     if not folder_summaries:
@@ -622,6 +644,19 @@ def suggest_tree_optimizations(
             agy_failed = True
             break
         chunk = folder_summaries[i : i + batch_size]
+        thumb_dirs = [
+            str(Path(str(f["thumb_path"])).parent)
+            for f in chunk
+            if f.get("thumb_path") and Path(str(f["thumb_path"])).exists()
+        ]
+        add_dir: str | None = None
+        if thumb_dirs:
+            try:
+                common = Path(os.path.commonpath(thumb_dirs))
+                add_dir = str(common) if common.exists() else thumb_dirs[0]
+            except ValueError:
+                add_dir = thumb_dirs[0]
+
         compact = [
             {
                 "folder": f.get("folder"),
@@ -630,17 +665,24 @@ def suggest_tree_optimizations(
                 "end_date": f.get("end_date"),
                 "location": f.get("location_label"),
                 "max_gap_hours": f.get("max_gap_hours"),
+                "is_midnight_merged": bool(f.get("is_midnight_merged", False)),
                 "thumbnail": f.get("thumb_path"),
             }
             for f in chunk
         ]
         prompt = (
-            "Analiza estas carpetas (máximo 12 por lote) y responde ÚNICAMENTE con JSON válido "
+            "Analiza estas carpetas (máximo 12 por lote) inspeccionando las miniaturas desde disco "
+            "en el directorio adjunto y responde ÚNICAMENTE con JSON válido "
             '{"suggestions": [{"type": "rename|merge|split", "before": ..., "after": ..., "reason": "..."}]}. '
-            "Reglas: split solo si count > 25 y max_gap_hours >= 3.0. "
+            "Reglas: usa títulos descriptivos reales en español según lo que se ve en cada imagen; "
+            "NUNCA uses etiquetas fijas como 'Sesión Mañana' o 'Sesión Tarde'; "
+            "split solo si count > 25, max_gap_hours >= 3.0 y is_midnight_merged es false. "
             "Carpetas: " + json.dumps(compact, ensure_ascii=False)
         )
-        argv = [resolved_bin or cmd_bin, "-m", selected_model, "-p", prompt]
+        argv = [resolved_bin or cmd_bin, "-m", selected_model]
+        if add_dir:
+            argv.extend(["--add-dir", add_dir])
+        argv.extend(["-p", prompt])
         try:
             proc = subprocess.run(
                 argv,
@@ -652,7 +694,11 @@ def suggest_tree_optimizations(
             if proc.returncode != 0 or not proc.stdout:
                 agy_failed = True
                 break
-            parsed = _parse_suggestions_json(proc.stdout, folder_meta)
+            parsed = _parse_suggestions_json(
+                proc.stdout,
+                folder_meta,
+                forbid_fixed_labels=forbid_fixed_labels,
+            )
             if parsed is None:
                 agy_failed = True
                 break
@@ -671,3 +717,22 @@ def suggest_tree_optimizations(
         "engine": f"agy · {selected_model}",
         "suggestions": all_suggestions,
     }
+
+
+def generate_tree_ai_suggestions(
+    folder_summaries: list[dict[str, Any]],
+    *,
+    cli_command: str = "agy",
+    model: str = DEFAULT_AGY_MODEL,
+    timeout: float = 60.0,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Visual + structural tree optimization via agy (--add-dir) forbidding fixed session labels."""
+    return suggest_tree_optimizations(
+        folder_summaries,
+        cli_command=cli_command,
+        model=model,
+        timeout=timeout,
+        cancel_event=cancel_event,
+        forbid_fixed_labels=True,
+    )

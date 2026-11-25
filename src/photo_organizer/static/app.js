@@ -6,6 +6,7 @@ const state = {
   totalItems: 0,
   items: [],
   sse: null,
+  lastLoggedPlaceholders: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -203,6 +204,16 @@ function updateProgressUI(snap) {
   if ($("cnt-dups")) $("cnt-dups").textContent = String(snap.duplicates_count || 0);
   if ($("cnt-screenshots")) $("cnt-screenshots").textContent = String(snap.screenshots_count || 0);
 
+  const placeholders = Number(snap.placeholders_count || 0);
+  if ($("cnt-placeholders")) $("cnt-placeholders").textContent = String(placeholders);
+  if ($("cnt-placeholders-chip")) {
+    $("cnt-placeholders-chip").classList.toggle("hidden", placeholders <= 0);
+  }
+  if (placeholders > 0 && placeholders !== state.lastLoggedPlaceholders) {
+    state.lastLoggedPlaceholders = placeholders;
+    logActivity(`OneDrive: ${placeholders} archivo(s) solo-en-la-nube detectados y omitidos sin descargar.`);
+  }
+
   const activePhaseNum = Number(phaseLabel[0]) || 1;
   document.querySelectorAll(".phase-step").forEach((el) => {
     const pNum = Number(el.getAttribute("data-phase") || 0);
@@ -285,6 +296,9 @@ async function loadTree() {
   }
 
   $("current-folder-title").textContent = state.selectedFolder || "Todos los elementos";
+  if ($("btn-clear-folder-filter")) {
+    $("btn-clear-folder-filter").classList.toggle("hidden", !state.selectedFolder);
+  }
   $("page-info").textContent = `Página ${state.page} (${state.totalItems} total)`;
 
   const grid = $("items-grid");
@@ -648,6 +662,18 @@ function bindEvents() {
         chk.checked = true;
         chk.dataset.idx = String(idx);
 
+        const img = document.createElement("img");
+        img.className = "ai-suggestion-thumb";
+        img.alt = "Vista previa";
+        if (s.thumb_url) {
+          img.src = s.thumb_url;
+        } else if (s.thumb_item_id) {
+          img.src = `/api/thumbnails/${encodeURIComponent(s.thumb_item_id)}`;
+        }
+        img.onerror = () => {
+          img.style.display = "none";
+        };
+
         const body = document.createElement("div");
         body.className = "ai-suggestion-body";
         const beforeTxt = Array.isArray(s.before) ? s.before.join(" + ") : String(s.before || "");
@@ -660,7 +686,7 @@ function bindEvents() {
         reason.textContent = s.reason || "";
         body.append(title, reason);
 
-        row.append(chk, body);
+        row.append(chk, img, body);
         list.appendChild(row);
       });
     }
@@ -802,9 +828,23 @@ function bindEvents() {
       if (Array.isArray(res.batches)) {
         renderBatches(res.batches);
       }
-      const msg = `Exportación completa: ${res.exported} exportados, ${res.sidecars_merged || 0} con sidecar .json, ${res.duplicates} duplicados, ${res.skipped} omitidos.`;
+      const exportedBytes = Number(res.exported_bytes || 0);
+      const gbVal = (exportedBytes / (1024 ** 3)).toFixed(2);
+      const mbVal = (exportedBytes / (1024 ** 2)).toFixed(1);
+      const sizeText = exportedBytes >= 1024 ** 3 ? `${gbVal} GB (${exportedBytes} bytes)` : `${mbVal} MB (${exportedBytes} bytes)`;
+      const msg = `Exportación completa: ${res.exported} archivos exportados · ${sizeText} · ${res.sidecars_merged || 0} con sidecar .json, ${res.duplicates} duplicados, ${res.skipped} omitidos.`;
       $("progress-stage").textContent = `Estado: ${msg}`;
       showToast(msg, "ok");
+      const toastEl = $("result-toast");
+      if (toastEl) {
+        const openBtn = document.createElement("button");
+        openBtn.type = "button";
+        openBtn.className = "btn small secondary";
+        openBtn.style.marginLeft = "0.75rem";
+        openBtn.textContent = "Abrir carpeta en Explorador";
+        openBtn.onclick = () => $("btn-open-dest")?.click();
+        toastEl.appendChild(openBtn);
+      }
       logActivity(msg);
       if ($("btn-open-dest")) {
         $("btn-open-dest").classList.remove("hidden");
@@ -818,10 +858,18 @@ function bindEvents() {
     }
   };
 
+  if ($("btn-clear-folder-filter")) {
+    $("btn-clear-folder-filter").onclick = () => {
+      state.selectedFolder = null;
+      state.page = 1;
+      loadTree();
+    };
+  }
+
   if ($("btn-open-dest")) {
     $("btn-open-dest").onclick = async () => {
       try {
-        await api("/api/open-destination", "POST", {
+        await api("/api/system/open-folder", "POST", {
           job_id: state.jobId,
           path: $("dest-dir").value.trim() || null,
         });

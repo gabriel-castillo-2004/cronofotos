@@ -51,6 +51,7 @@ def run_two_phase_export(
     eff_batch_size = batch_size if batch_size and batch_size > 0 else 100
     conn = open_connection(db_path)
     exported = 0
+    exported_bytes = 0
     duplicates = 0
     skipped = 0
     failed = 0
@@ -199,7 +200,9 @@ def run_two_phase_export(
                 )
                 conn.commit()
 
+                file_size = final_path.stat().st_size if final_path.exists() else 0
                 exported += 1
+                exported_bytes += file_size
                 batch_exported += 1
                 batch_info["processed_items"] += 1
                 if row["sidecar_path"]:
@@ -210,7 +213,7 @@ def run_two_phase_export(
                 else:
                     lib_index[expected_sha] = {
                         "rel_path": f"{row['target_folder']}/{row['target_filename']}",
-                        "size_bytes": final_path.stat().st_size if final_path.exists() else 0,
+                        "size_bytes": file_size,
                     }
 
             batch_info["elapsed_seconds"] = round(time.monotonic() - t0, 3)
@@ -229,6 +232,8 @@ def run_two_phase_export(
 
     return {
         "exported": exported,
+        "exported_bytes": exported_bytes,
+        "exported_gb": round(exported_bytes / (1024 ** 3), 4),
         "duplicates": duplicates,
         "skipped": skipped,
         "failed": failed,
