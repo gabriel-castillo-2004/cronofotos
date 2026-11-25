@@ -721,6 +721,78 @@ def _load_people_labels(people_dir: Path | str | None) -> list[str]:
     return labels
 
 
+def _resolve_face_clusters_dir(
+    face_clusters_dir: Path | str | None,
+    data_dir: Path | str | None,
+    people_dir: Path | str | None,
+) -> Path | None:
+    """Resolve `<data_dir>/face_clusters` from explicit path, data_dir, or people_dir."""
+    if face_clusters_dir:
+        return Path(face_clusters_dir)
+    if data_dir:
+        return Path(data_dir) / "face_clusters"
+    if people_dir:
+        return Path(people_dir).parent / "face_clusters"
+    return None
+
+
+def _is_anchor_person_label(label: str) -> bool:
+    """Return True if label represents the anchor user ('Yo (ancla)')."""
+    low = re.sub(r"\s+", " ", (label or "").strip().lower())
+    return low in {"yo (ancla)", "yo(ancla)", "yo"} or "yo (ancla)" in low
+
+
+def _load_face_cluster_records(face_clusters_dir: Path | None) -> list[dict[str, Any]]:
+    """Load all face cluster JSON records from `face_clusters_dir`."""
+    if not face_clusters_dir or not face_clusters_dir.exists() or not face_clusters_dir.is_dir():
+        return []
+    records: list[dict[str, Any]] = []
+    for jf in sorted(face_clusters_dir.glob("*.json")):
+        try:
+            data = json.loads(jf.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and data.get("cluster_id"):
+            records.append(data)
+        elif isinstance(data, list):
+            records.extend(item for item in data if isinstance(item, dict) and item.get("cluster_id"))
+    return records
+
+
+def _load_whitelisted_face_clusters(face_clusters_dir: Path | None) -> tuple[bool, list[dict[str, Any]]]:
+    """Return (has_any_clusters, whitelisted_clusters) filtering out unnamed and ignored entries."""
+    all_records = _load_face_cluster_records(face_clusters_dir)
+    if not all_records:
+        return False, []
+    whitelisted = [
+        rec
+        for rec in all_records
+        if not bool(rec.get("ignored", False)) and str(rec.get("label") or "").strip() != ""
+    ]
+    return True, whitelisted
+
+
+def resolve_folder_whitelisted_people(
+    media_ids: list[str] | set[str] | None,
+    whitelisted_clusters: list[dict[str, Any]],
+) -> list[str]:
+    """Cross-reference folder media_ids against whitelisted clusters, excluding 'Yo (ancla)'."""
+    folder_mids = {str(mid) for mid in (media_ids or []) if mid}
+    if not folder_mids or not whitelisted_clusters:
+        return []
+    confirmed: list[str] = []
+    seen: set[str] = set()
+    for cl in whitelisted_clusters:
+        label = str(cl.get("label") or "").strip()
+        if not label or _is_anchor_person_label(label):
+            continue
+        cl_mids = {str(mid) for mid in (cl.get("media_ids") or []) if mid}
+        if folder_mids & cl_mids and label not in seen:
+            seen.add(label)
+            confirmed.append(label)
+    return confirmed
+
+
 def _collect_add_dirs(
     people_dir: Path | str | None,
     extra_dirs: list[Path | str] | None = None,
@@ -790,6 +862,8 @@ def suggest_tree_optimizations(
     cancel_event: threading.Event | None = None,
     forbid_fixed_labels: bool = False,
     people_dir: Path | str | None = None,
+    face_clusters_dir: Path | str | None = None,
+    data_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Analyze folder metadata + 3 scene thumbs + up to 4 face crops + key people via agy."""
     if not folder_summaries:
@@ -821,7 +895,9 @@ def suggest_tree_optimizations(
     batch_size = 12
     all_suggestions: list[dict[str, Any]] = []
     failure_reason: str | None = None
-    people_labels = _load_people_labels(people_dir)
+    resolved_fc_dir = _resolve_face_clusters_dir(face_clusters_dir, data_dir, people_dir)
+    has_clusters, whitelisted_clusters = _load_whitelisted_face_clusters(resolved_fc_dir)
+    legacy_people_labels = [] if has_clusters else _load_people_labels(people_dir)
 
     for i in range(0, len(folder_summaries), batch_size):
         if cancel_event is not None and cancel_event.is_set():
@@ -834,6 +910,8 @@ def suggest_tree_optimizations(
         tmp_root = Path(tmp_dir)
         compact: list[dict[str, Any]] = []
         has_prepared_thumbs = False
+        batch_confirmed_people: list[str] = []
+        seen_batch_people: set[str] = set()
 
         for f_idx, f in enumerate(chunk):
             rep_srcs = _select_representative_thumb_paths(f, limit=3)
@@ -854,19 +932,30 @@ def suggest_tree_optimizations(
             if face_crops:
                 has_prepared_thumbs = True
 
-            compact.append(
-                {
-                    "folder": f.get("folder"),
-                    "count": f.get("count"),
-                    "start_date": f.get("start_date"),
-                    "end_date": f.get("end_date"),
-                    "location": f.get("location_label"),
-                    "max_gap_hours": f.get("max_gap_hours"),
-                    "is_midnight_merged": bool(f.get("is_midnight_merged", False)),
-                    "thumbnails": prepared_paths if prepared_paths else ([f.get("thumb_path")] if f.get("thumb_path") else []),
-                    "face_crops": [str(p) for p in face_crops],
-                }
+            confirmed_people = (
+                resolve_folder_whitelisted_people(f.get("media_ids"), whitelisted_clusters)
+                if has_clusters
+                else []
             )
+            for pname in confirmed_people:
+                if pname not in seen_batch_people:
+                    seen_batch_people.add(pname)
+                    batch_confirmed_people.append(pname)
+
+            compact_entry: dict[str, Any] = {
+                "folder": f.get("folder"),
+                "count": f.get("count"),
+                "start_date": f.get("start_date"),
+                "end_date": f.get("end_date"),
+                "location": f.get("location_label"),
+                "max_gap_hours": f.get("max_gap_hours"),
+                "is_midnight_merged": bool(f.get("is_midnight_merged", False)),
+                "thumbnails": prepared_paths if prepared_paths else ([f.get("thumb_path")] if f.get("thumb_path") else []),
+                "face_crops": [str(p) for p in face_crops],
+            }
+            if confirmed_people:
+                compact_entry["personas_confirmadas"] = confirmed_people
+            compact.append(compact_entry)
 
         extra_dirs: list[Path | str] = []
         if has_prepared_thumbs:
@@ -884,12 +973,19 @@ def suggest_tree_optimizations(
                 except ValueError:
                     extra_dirs.append(Path(thumb_dirs[0]))
 
-        add_dirs = _collect_add_dirs(people_dir, extra_dirs)
-        people_hint = (
-            f" Personas clave de referencia en personas_referencia/: {', '.join(people_labels)}."
-            if people_labels
-            else ""
-        )
+        add_dirs = _collect_add_dirs(None if has_clusters else people_dir, extra_dirs)
+        if has_clusters:
+            people_hint = (
+                f" Personas confirmadas presentes en estas carpetas: {', '.join(batch_confirmed_people)}."
+                if batch_confirmed_people
+                else ""
+            )
+        else:
+            people_hint = (
+                f" Personas clave de referencia en personas_referencia/: {', '.join(legacy_people_labels)}."
+                if legacy_people_labels
+                else ""
+            )
 
         prompt = (
             "Lee directamente desde disco los archivos de imagen adjuntos en los directorios (--add-dir): "
@@ -966,6 +1062,8 @@ def generate_tree_ai_suggestions(
     timeout: float = 60.0,
     cancel_event: threading.Event | None = None,
     people_dir: Path | str | None = None,
+    face_clusters_dir: Path | str | None = None,
+    data_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Visual + structural tree optimization via agy (--add-dir) forbidding fixed session labels."""
     return suggest_tree_optimizations(
@@ -976,6 +1074,8 @@ def generate_tree_ai_suggestions(
         cancel_event=cancel_event,
         forbid_fixed_labels=True,
         people_dir=people_dir,
+        face_clusters_dir=face_clusters_dir,
+        data_dir=data_dir,
     )
 
 
@@ -1062,6 +1162,8 @@ def debate_folder_batch_with_agy(
     model: str = DEFAULT_AGY_MODEL,
     timeout: float = 60.0,
     people_dir: Path | str | None = None,
+    face_clusters_dir: Path | str | None = None,
+    data_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Run 2-role consensus debate (Curador -> Auditor) on a batch of up to 5 folders."""
     if not batch_summaries:
@@ -1081,11 +1183,17 @@ def debate_folder_batch_with_agy(
             "error_reason": f"binario '{cmd_bin}' no encontrado",
         }
 
+    resolved_fc_dir = _resolve_face_clusters_dir(face_clusters_dir, data_dir, people_dir)
+    has_clusters, whitelisted_clusters = _load_whitelisted_face_clusters(resolved_fc_dir)
+    legacy_people_labels = [] if has_clusters else _load_people_labels(people_dir)
+
     tmp_dir = tempfile.mkdtemp(prefix="agy_debate_")
     tmp_root = Path(tmp_dir)
     try:
         compact: list[dict[str, Any]] = []
         has_prepared = False
+        batch_confirmed_people: list[str] = []
+        seen_batch_people: set[str] = set()
         for f_idx, f in enumerate(batch_summaries[:5]):
             rep_srcs = _select_representative_thumb_paths(f, limit=3)
             prepared_paths: list[str] = []
@@ -1105,26 +1213,43 @@ def debate_folder_batch_with_agy(
             if face_crops:
                 has_prepared = True
 
-            compact.append(
-                {
-                    "folder": f.get("folder"),
-                    "count": f.get("count"),
-                    "start_date": f.get("start_date"),
-                    "end_date": f.get("end_date"),
-                    "location": f.get("location_label"),
-                    "thumbnails": prepared_paths if prepared_paths else ([f.get("thumb_path")] if f.get("thumb_path") else []),
-                    "face_crops": [str(p) for p in face_crops],
-                }
+            confirmed_people = (
+                resolve_folder_whitelisted_people(f.get("media_ids"), whitelisted_clusters)
+                if has_clusters
+                else []
             )
+            for pname in confirmed_people:
+                if pname not in seen_batch_people:
+                    seen_batch_people.add(pname)
+                    batch_confirmed_people.append(pname)
+
+            compact_entry: dict[str, Any] = {
+                "folder": f.get("folder"),
+                "count": f.get("count"),
+                "start_date": f.get("start_date"),
+                "end_date": f.get("end_date"),
+                "location": f.get("location_label"),
+                "thumbnails": prepared_paths if prepared_paths else ([f.get("thumb_path")] if f.get("thumb_path") else []),
+                "face_crops": [str(p) for p in face_crops],
+            }
+            if confirmed_people:
+                compact_entry["personas_confirmadas"] = confirmed_people
+            compact.append(compact_entry)
 
         extra_dirs = [tmp_root] if has_prepared else []
-        add_dirs = _collect_add_dirs(people_dir, extra_dirs)
-        people_labels = _load_people_labels(people_dir)
-        people_hint = (
-            f" Personas clave disponibles: {', '.join(people_labels)}."
-            if people_labels
-            else ""
-        )
+        add_dirs = _collect_add_dirs(None if has_clusters else people_dir, extra_dirs)
+        if has_clusters:
+            people_hint = (
+                f" Personas confirmadas presentes en estas carpetas: {', '.join(batch_confirmed_people)}."
+                if batch_confirmed_people
+                else ""
+            )
+        else:
+            people_hint = (
+                f" Personas clave disponibles: {', '.join(legacy_people_labels)}."
+                if legacy_people_labels
+                else ""
+            )
 
         def _build_argv(prompt_text: str) -> list[str]:
             argv = [resolved_bin or cmd_bin, "-m", selected_model]

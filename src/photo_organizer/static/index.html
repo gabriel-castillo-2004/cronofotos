@@ -272,6 +272,14 @@
             <button id="btn-add-person" type="button" class="btn secondary small">Agregar</button>
           </div>
           <div id="people-list" class="people-list" style="display:flex;flex-wrap:wrap;gap:0.5rem;"></div>
+          <div class="frequent-faces-block" style="margin-top:0.75rem;padding-top:0.65rem;border-top:1px solid var(--border, #334155);">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem;flex-wrap:wrap;">
+              <h4 style="margin:0;">👥 Personas Frecuentes (Lista blanca)</h4>
+              <button id="btn-discover-faces" type="button" class="btn secondary small">Detectar rostros frecuentes</button>
+            </div>
+            <span id="faces-discover-status" class="muted" style="display:block;font-size:0.8rem;margin-top:0.25rem;"></span>
+            <div id="face-clusters-grid" class="face-clusters-grid"></div>
+          </div>
         </section>
         <div class="modal-actions">
           <button id="btn-close-settings" type="button" class="btn secondary">Cancelar</button>

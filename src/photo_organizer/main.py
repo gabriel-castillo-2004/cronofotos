@@ -29,14 +29,17 @@ from datetime import datetime
 from photo_organizer.ai_classifier import (
     DEFAULT_AGY_MODEL,
     GeminiClassifier,
+    _load_whitelisted_face_clusters,
     classify_with_agy,
     debate_folder_batch_with_agy,
     generate_tree_ai_suggestions,
+    resolve_folder_whitelisted_people,
     suggest_tree_optimizations,
 )
 from photo_organizer.clustering import offline_reverse_geocode
 from photo_organizer.config import (
     AGY_ALLOWED_NAMES,
+    IMAGE_EXTENSIONS,
     PEOPLE_IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
     OrganizerConfig,
@@ -54,7 +57,13 @@ from photo_organizer.exporter import (
     run_two_phase_export,
 )
 from photo_organizer.media import BinaryHealthCheck, MediaMetadataService
-from photo_organizer.thumbnails import ThumbnailCache, extract_top_face_crops
+from photo_organizer.thumbnails import (
+    ThumbnailCache,
+    discover_frequent_faces,
+    extract_top_face_crops,
+    load_face_clusters,
+    update_face_cluster,
+)
 from photo_organizer.worker import PipelineOrchestrator
 
 try:
@@ -146,6 +155,15 @@ class _LocalAppCore:
         self._loop_thread: threading.Thread | None = None
         self._loop_lock = threading.Lock()
         self._ai_cancel_event = threading.Event()
+        self._face_discover_lock = threading.Lock()
+        self._face_discover_state: dict[str, Any] = {
+            "status": "idle",
+            "job_id": None,
+            "processed": 0,
+            "total": 0,
+            "clusters_found": 0,
+            "error": None,
+        }
 
     def _ensure_bg_loop(self) -> asyncio.AbstractEventLoop:
         with self._loop_lock:
@@ -604,6 +622,122 @@ class _LocalAppCore:
         ctype, _ = mimetypes.guess_type(str(fpath))
         return fpath.read_bytes(), (ctype or "image/jpeg")
 
+    def _face_clusters_dir(self) -> Path:
+        return self.cfg.data_dir / "face_clusters"
+
+    def get_face_discovery_status(self) -> dict[str, Any]:
+        with self._face_discover_lock:
+            return dict(self._face_discover_state)
+
+    def start_face_discovery(self, job_id: str | None = None) -> dict[str, Any]:
+        conn = open_connection(self.cfg.db_path)
+        try:
+            jid = job_id or self.state.get("active_job_id")
+            if not jid:
+                row = conn.execute("SELECT id FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+                jid = str(row["id"]) if row else None
+            if not jid:
+                raise _ApiError(404, "No hay un trabajo escaneado para analizar rostros")
+            rows = conn.execute(
+                """
+                SELECT id, source_path, ext
+                FROM media_items
+                WHERE job_id = ?
+                ORDER BY COALESCE(captured_at, '') ASC, source_path ASC
+                """,
+                (jid,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        media_records = [
+            {
+                "id": str(r["id"]),
+                "source_path": str(r["source_path"]),
+                "ext": str(r["ext"] or ""),
+            }
+            for r in rows
+            if str(r["ext"] or "").lower() in IMAGE_EXTENSIONS
+        ]
+
+        with self._face_discover_lock:
+            self._face_discover_state = {
+                "status": "running",
+                "job_id": jid,
+                "processed": 0,
+                "total": len(media_records),
+                "clusters_found": 0,
+                "error": None,
+            }
+            snapshot = dict(self._face_discover_state)
+
+        def _run() -> None:
+            def _on_progress(processed: int, total: int, clusters_found: int) -> None:
+                with self._face_discover_lock:
+                    self._face_discover_state["processed"] = processed
+                    self._face_discover_state["total"] = total
+                    self._face_discover_state["clusters_found"] = clusters_found
+
+            try:
+                clusters = discover_frequent_faces(
+                    media_records,
+                    self.cfg.data_dir,
+                    progress_cb=_on_progress,
+                )
+                with self._face_discover_lock:
+                    self._face_discover_state["status"] = "completed"
+                    self._face_discover_state["processed"] = len(media_records)
+                    self._face_discover_state["clusters_found"] = len(clusters)
+            except Exception as exc:
+                with self._face_discover_lock:
+                    self._face_discover_state["status"] = "failed"
+                    self._face_discover_state["error"] = str(exc)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return snapshot
+
+    def list_face_clusters(self, *, include_ignored: bool = False) -> dict[str, Any]:
+        clusters = load_face_clusters(self._face_clusters_dir(), include_ignored=include_ignored)
+        return {
+            "clusters": clusters,
+            "discovery": self.get_face_discovery_status(),
+        }
+
+    def update_face_cluster_entry(
+        self,
+        cluster_id: str,
+        *,
+        label: str | None = None,
+        ignored: bool | None = None,
+    ) -> dict[str, Any]:
+        updated = update_face_cluster(
+            self._face_clusters_dir(),
+            cluster_id,
+            label=label,
+            ignored=ignored,
+        )
+        if updated is None:
+            raise _ApiError(404, "Clúster facial no encontrado")
+        return {"cluster": updated, **updated}
+
+    def get_face_cluster_image(self, cluster_id: str) -> tuple[bytes, str]:
+        fdir = self._face_clusters_dir()
+        img_path = fdir / f"{cluster_id}.jpg"
+        if not img_path.is_file():
+            jf = fdir / f"{cluster_id}.json"
+            if jf.is_file():
+                try:
+                    data = json.loads(jf.read_text(encoding="utf-8"))
+                    cp = Path(str(data.get("crop_path") or ""))
+                    if cp.is_file():
+                        img_path = cp
+                except (OSError, json.JSONDecodeError):
+                    pass
+        if not img_path.is_file():
+            raise _ApiError(404, "Miniatura de rostro no encontrada")
+        ctype, _ = mimetypes.guess_type(str(img_path))
+        return img_path.read_bytes(), (ctype or "image/jpeg")
+
     def regenerate_ai_names(self, job_id: str) -> dict[str, Any]:
         """Invalidate AI name cache and re-run AI folder naming on 01_Recuerdos/ folders."""
         self._ai_cancel_event.clear()
@@ -691,6 +825,18 @@ class _LocalAppCore:
                             file_prefix="face",
                         )
                         add_dirs.append(tmp_scene_path)
+
+                    _has_fc, _wl_fc = _load_whitelisted_face_clusters(self._face_clusters_dir())
+                    _confirmed_people = (
+                        resolve_folder_whitelisted_people(
+                            [str(it["id"]) for it in folder_items],
+                            _wl_fc,
+                        )
+                        if _has_fc
+                        else []
+                    )
+                    if _confirmed_people:
+                        summary = f"{summary} | Personas confirmadas: {', '.join(_confirmed_people)}"
 
                     err_info: dict[str, str] = {}
                     try:
@@ -839,6 +985,7 @@ class _LocalAppCore:
                 {
                     "folder": folder,
                     "count": len(items),
+                    "media_ids": [str(it["id"]) for it in items],
                     "start_date": parsed_dts[0].isoformat() if parsed_dts else None,
                     "end_date": parsed_dts[-1].isoformat() if parsed_dts else None,
                     "location_label": loc_label,
@@ -856,6 +1003,8 @@ class _LocalAppCore:
             timeout=60.0,
             cancel_event=self._ai_cancel_event,
             people_dir=self.cfg.people_dir,
+            face_clusters_dir=self._face_clusters_dir(),
+            data_dir=self.cfg.data_dir,
         )
         enriched: list[dict[str, Any]] = []
         for s in res["suggestions"]:
@@ -1244,6 +1393,7 @@ class _LocalAppCore:
                     {
                         "folder": folder,
                         "count": len(items),
+                        "media_ids": [str(it["id"]) for it in items],
                         "start_date": min(dates) if dates else None,
                         "end_date": max(dates) if dates else None,
                         "location_label": loc_label,
@@ -1258,6 +1408,8 @@ class _LocalAppCore:
                 model=model,
                 timeout=60.0,
                 people_dir=self.cfg.people_dir,
+                face_clusters_dir=self._face_clusters_dir(),
+                data_dir=self.cfg.data_dir,
             )
             if not res.get("ok"):
                 paused_reason = str(res.get("error_reason") or "Error de cuota o autenticación en agy")
@@ -1507,6 +1659,52 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
     async def get_person_image(person_id: str) -> Response:
         try:
             data, ctype = await asyncio.to_thread(core.get_person_image, person_id)
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        return Response(content=data, media_type=ctype)
+
+    @app.post("/api/faces/discover")
+    async def discover_faces(request: Request) -> JSONResponse:
+        try:
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            job_id = body.get("job_id") if isinstance(body, dict) else None
+            res = await asyncio.to_thread(core.start_face_discovery, job_id)
+            return JSONResponse(status_code=202, content=res)
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.get("/api/faces/discover/status")
+    async def discover_faces_status() -> dict[str, Any]:
+        return core.get_face_discovery_status()
+
+    @app.get("/api/faces/clusters")
+    async def list_face_clusters(include_ignored: bool = False) -> dict[str, Any]:
+        return await asyncio.to_thread(core.list_face_clusters, include_ignored=include_ignored)
+
+    @app.post("/api/faces/clusters/{cluster_id}")
+    async def update_face_cluster_route(cluster_id: str, request: Request) -> dict[str, Any]:
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                body = {}
+            label = body.get("label") if "label" in body else None
+            ignored = body.get("ignored") if "ignored" in body else None
+            return await asyncio.to_thread(
+                core.update_face_cluster_entry,
+                cluster_id,
+                label=label,
+                ignored=ignored,
+            )
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.get("/api/faces/clusters/{cluster_id}/image")
+    async def get_face_cluster_image(cluster_id: str) -> Response:
+        try:
+            data, ctype = await asyncio.to_thread(core.get_face_cluster_image, cluster_id)
         except _ApiError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         return Response(content=data, media_type=ctype)
@@ -1784,6 +1982,16 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                     person_id = path[len("/api/people/") : -len("/image")].strip("/")
                     data, ctype = core.get_person_image(person_id)
                     self._send_bytes(200, ctype, data)
+                elif path == "/api/faces/discover/status":
+                    self._send_json(200, core.get_face_discovery_status())
+                elif path == "/api/faces/clusters":
+                    qs = parse_qs(parsed.query)
+                    inc = qs.get("include_ignored", ["0"])[0].lower() in {"1", "true", "yes"}
+                    self._send_json(200, core.list_face_clusters(include_ignored=inc))
+                elif path.startswith("/api/faces/clusters/") and path.endswith("/image"):
+                    cluster_id = path[len("/api/faces/clusters/") : -len("/image")].strip("/")
+                    data, ctype = core.get_face_cluster_image(cluster_id)
+                    self._send_bytes(200, ctype, data)
                 elif path == "/api/scan/status":
                     self._send_json(200, core.scan_status())
                 elif path == "/api/tree":
@@ -1949,6 +2157,16 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                     self._send_json(
                         200,
                         core.open_destination(body.get("job_id"), body.get("path")),
+                    )
+                elif path == "/api/faces/discover":
+                    self._send_json(202, core.start_face_discovery(body.get("job_id")))
+                elif path.startswith("/api/faces/clusters/"):
+                    cluster_id = path[len("/api/faces/clusters/") :].strip("/")
+                    label = body.get("label") if "label" in body else None
+                    ignored = body.get("ignored") if "ignored" in body else None
+                    self._send_json(
+                        200,
+                        core.update_face_cluster_entry(cluster_id, label=label, ignored=ignored),
                     )
                 elif path == "/api/system/open-folder":
                     self._send_json(
