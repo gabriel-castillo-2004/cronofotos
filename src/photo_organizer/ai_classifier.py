@@ -977,3 +977,249 @@ def generate_tree_ai_suggestions(
         forbid_fixed_labels=True,
         people_dir=people_dir,
     )
+
+
+_QUOTA_OR_AUTH_KEYWORDS = (
+    "429",
+    "resource_exhausted",
+    "quota",
+    "cuota",
+    "token",
+    "rate limit",
+    "ratelimit",
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+    "auth",
+    "exceeded",
+    "limit",
+)
+
+
+def _is_quota_or_auth_error(raw: str) -> bool:
+    low = (raw or "").lower()
+    return any(kw in low for kw in _QUOTA_OR_AUTH_KEYWORDS)
+
+
+def _extract_json_dict(stdout: str) -> dict[str, Any] | None:
+    text = (stdout or "").strip()
+    if not text:
+        return None
+    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    candidate = fence_match.group(1).strip() if fence_match else text
+    candidates = [candidate]
+    obj_match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+    if obj_match:
+        candidates.append(obj_match.group(0))
+    for jc in candidates:
+        try:
+            parsed = json.loads(jc)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
+
+
+def _invoke_agy_json(
+    argv: list[str],
+    *,
+    timeout: float = 60.0,
+) -> tuple[dict[str, Any] | None, str | None, bool]:
+    """Run agy subprocess and return (parsed_dict, error_reason, is_quota_or_auth)."""
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        msg = _summarize_failure_reason(str(exc)) or "error ejecutando agy"
+        return None, msg, _is_quota_or_auth_error(msg)
+
+    if proc.returncode != 0:
+        raw_err = proc.stderr or proc.stdout or ""
+        detail = _summarize_failure_reason(raw_err)
+        reason = f"código {proc.returncode}: {detail}" if detail else f"código {proc.returncode}"
+        return None, reason, _is_quota_or_auth_error(raw_err)
+
+    if not proc.stdout or not proc.stdout.strip():
+        return None, "salida vacía de agy", False
+
+    parsed = _extract_json_dict(proc.stdout)
+    if parsed is None:
+        return None, "salida JSON inválida de agy", False
+    return parsed, None, False
+
+
+def debate_folder_batch_with_agy(
+    batch_summaries: list[dict[str, Any]],
+    *,
+    cli_command: str = "agy",
+    model: str = DEFAULT_AGY_MODEL,
+    timeout: float = 60.0,
+    people_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Run 2-role consensus debate (Curador -> Auditor) on a batch of up to 5 folders."""
+    if not batch_summaries:
+        return {"ok": True, "decisions": [], "history": []}
+
+    cmd_bin = (cli_command or "agy").strip() or "agy"
+    resolved_bin = resolve_cli_binary(cmd_bin, allowed_names=AGY_ALLOWED_NAMES)
+    selected_model = (model or DEFAULT_AGY_MODEL).strip() or DEFAULT_AGY_MODEL
+    can_call_agy = resolved_bin is not None or (
+        subprocess.run is _ORIG_SUBPROCESS_RUN and is_standard_agy_binary(cmd_bin)
+    )
+    if not can_call_agy:
+        return {
+            "ok": False,
+            "paused": True,
+            "is_quota_or_auth": True,
+            "error_reason": f"binario '{cmd_bin}' no encontrado",
+        }
+
+    tmp_dir = tempfile.mkdtemp(prefix="agy_debate_")
+    tmp_root = Path(tmp_dir)
+    try:
+        compact: list[dict[str, Any]] = []
+        has_prepared = False
+        for f_idx, f in enumerate(batch_summaries[:5]):
+            rep_srcs = _select_representative_thumb_paths(f, limit=3)
+            prepared_paths: list[str] = []
+            for t_idx, src_p in enumerate(rep_srcs):
+                dst_p = tmp_root / f"folder_{f_idx:02d}_scene_{t_idx + 1}.jpg"
+                _prepare_temp_thumb(src_p, dst_p, max_dim=320)
+                prepared_paths.append(str(dst_p))
+                has_prepared = True
+
+            candidate_paths = _collect_candidate_image_paths(f)
+            face_crops = extract_top_face_crops(
+                candidate_paths,
+                tmp_root,
+                max_faces=4,
+                file_prefix=f"folder_{f_idx:02d}_face",
+            )
+            if face_crops:
+                has_prepared = True
+
+            compact.append(
+                {
+                    "folder": f.get("folder"),
+                    "count": f.get("count"),
+                    "start_date": f.get("start_date"),
+                    "end_date": f.get("end_date"),
+                    "location": f.get("location_label"),
+                    "thumbnails": prepared_paths if prepared_paths else ([f.get("thumb_path")] if f.get("thumb_path") else []),
+                    "face_crops": [str(p) for p in face_crops],
+                }
+            )
+
+        extra_dirs = [tmp_root] if has_prepared else []
+        add_dirs = _collect_add_dirs(people_dir, extra_dirs)
+        people_labels = _load_people_labels(people_dir)
+        people_hint = (
+            f" Personas clave disponibles: {', '.join(people_labels)}."
+            if people_labels
+            else ""
+        )
+
+        def _build_argv(prompt_text: str) -> list[str]:
+            argv = [resolved_bin or cmd_bin, "-m", selected_model]
+            for add_d in add_dirs:
+                argv.extend(["--add-dir", str(add_d)])
+            argv.extend(["-p", prompt_text])
+            return argv
+
+        # Role 1: Agente Curador
+        curador_prompt = (
+            "Actúa como Agente Curador de fotografías. Analiza las miniaturas de escena y rostros "
+            "detectados para proponer nombres buscables en español con formato "
+            "'Evento + Personas Clave + Lugar'. "
+            f"{people_hint} "
+            "Responde ÚNICAMENTE con JSON válido: "
+            '{"proposals": [{"folder": "...", "proposed_name": "...", "reason": "..."}]}. '
+            "Carpetas: " + json.dumps(compact, ensure_ascii=False)
+        )
+        curador_json, err1, is_q1 = _invoke_agy_json(_build_argv(curador_prompt), timeout=timeout)
+        if curador_json is None:
+            return {
+                "ok": False,
+                "paused": True,
+                "is_quota_or_auth": is_q1,
+                "error_reason": err1 or "Error en Agente Curador",
+            }
+
+        proposals = curador_json.get("proposals")
+        if not isinstance(proposals, list):
+            proposals = []
+
+        # Role 2: Agente Auditor
+        auditor_prompt = (
+            "Actúa como Agente Auditor. Revisa las propuestas del Agente Curador, corrige nombres "
+            "genéricos difíciles de buscar en Google Drive, sugiere fusiones de carpetas consecutivas "
+            "relacionadas (merge_with) y consolida el nombre final en español. "
+            "Responde ÚNICAMENTE con JSON válido: "
+            '{"decisions": [{"folder": "...", "final_name": "...", "merge_with": null, "reason": "..."}]}. '
+            "Propuestas del Curador: " + json.dumps(proposals, ensure_ascii=False) + " "
+            "Carpetas: " + json.dumps(compact, ensure_ascii=False)
+        )
+        auditor_json, err2, is_q2 = _invoke_agy_json(_build_argv(auditor_prompt), timeout=timeout)
+        if auditor_json is None:
+            return {
+                "ok": False,
+                "paused": True,
+                "is_quota_or_auth": is_q2,
+                "error_reason": err2 or "Error en Agente Auditor",
+            }
+
+        proposals_by_folder = {
+            str(p.get("folder")): p
+            for p in proposals
+            if isinstance(p, dict) and p.get("folder")
+        }
+        raw_decisions = auditor_json.get("decisions")
+        if not isinstance(raw_decisions, list):
+            raw_decisions = []
+
+        decisions_by_folder: dict[str, dict[str, Any]] = {}
+        for d in raw_decisions:
+            if isinstance(d, dict) and d.get("folder"):
+                decisions_by_folder[str(d["folder"])] = d
+
+        final_decisions: list[dict[str, Any]] = []
+        for f in batch_summaries[:5]:
+            f_path = str(f.get("folder") or "")
+            prop = proposals_by_folder.get(f_path, {})
+            dec = decisions_by_folder.get(f_path, {})
+            raw_name = str(
+                dec.get("final_name")
+                or prop.get("proposed_name")
+                or ""
+            ).strip()
+            clean_name = _clean_label(raw_name)
+            merge_with = dec.get("merge_with")
+            if isinstance(merge_with, str):
+                merge_with = merge_with.strip() or None
+            else:
+                merge_with = None
+            final_decisions.append(
+                {
+                    "folder": f_path,
+                    "final_name": clean_name,
+                    "merge_with": merge_with,
+                    "curador": prop.get("proposed_name"),
+                    "auditor": clean_name,
+                    "reason": str(dec.get("reason") or prop.get("reason") or "Consenso Curador + Auditor"),
+                }
+            )
+
+        return {
+            "ok": True,
+            "decisions": final_decisions,
+            "engine": f"agy · {selected_model}",
+        }
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

@@ -30,6 +30,7 @@ from photo_organizer.ai_classifier import (
     DEFAULT_AGY_MODEL,
     GeminiClassifier,
     classify_with_agy,
+    debate_folder_batch_with_agy,
     generate_tree_ai_suggestions,
     suggest_tree_optimizations,
 )
@@ -45,7 +46,12 @@ from photo_organizer.config import (
     validate_source_dest_pair,
 )
 from photo_organizer.db import init_db, open_connection, recompute_filenames
-from photo_organizer.exporter import run_two_phase_export
+from photo_organizer.exporter import (
+    PORTABLE_PLAN_FILENAME,
+    export_portable_plan,
+    import_portable_plan,
+    run_two_phase_export,
+)
 from photo_organizer.media import BinaryHealthCheck, MediaMetadataService
 from photo_organizer.thumbnails import ThumbnailCache, extract_top_face_crops
 from photo_organizer.worker import PipelineOrchestrator
@@ -1070,6 +1076,245 @@ class _LocalAppCore:
             master_index_path=eff_master_index,
         )
 
+    def _resolve_job_and_dest(self, job_id: str | None) -> tuple[str, Path]:
+        conn = open_connection(self.cfg.db_path)
+        try:
+            if job_id:
+                row = conn.execute("SELECT id, dest_dir FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            else:
+                row = conn.execute("SELECT id, dest_dir FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+            if not row:
+                raise _ApiError(404, "No hay trabajo activo")
+            return str(row["id"]), Path(str(row["dest_dir"]))
+        finally:
+            conn.close()
+
+    def export_tree_plan(self, job_id: str | None = None) -> dict[str, Any]:
+        jid, dest_dir = self._resolve_job_and_dest(job_id)
+        return export_portable_plan(self.cfg.db_path, jid, dest_dir)
+
+    def import_tree_plan(
+        self,
+        job_id: str | None = None,
+        plan: dict[str, Any] | None = None,
+        plan_path: str | None = None,
+    ) -> dict[str, Any]:
+        jid, dest_dir = self._resolve_job_and_dest(job_id)
+        plan_data = plan
+        resolved_path = Path(plan_path) if plan_path else (dest_dir / PORTABLE_PLAN_FILENAME)
+        if plan_data is None:
+            if not resolved_path.is_file():
+                raise _ApiError(404, f"No se encontró el archivo de plan: {resolved_path}")
+            try:
+                plan_data = json.loads(resolved_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise _ApiError(400, f"Plan JSON inválido: {exc}") from exc
+        if not isinstance(plan_data, dict):
+            raise _ApiError(400, "El plan debe ser un objeto JSON")
+        res = import_portable_plan(self.cfg.db_path, jid, plan_data)
+        res["plan_path"] = str(resolved_path)
+        return res
+
+    def run_ai_debate(
+        self,
+        job_id: str | None = None,
+        *,
+        resume: bool = False,
+    ) -> dict[str, Any]:
+        """Run resumable 2-agent consensus debate (Curador + Auditor) in batches of 5 folders."""
+        from datetime import timezone as _tz
+
+        jid, dest_dir = self._resolve_job_and_dest(job_id)
+        cli_cmd = self.state.get("antigravity_cli") or "agy"
+        model = self.state.get("model") or DEFAULT_AGY_MODEL
+
+        conn = open_connection(self.cfg.db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, source_path, ext, sha256, captured_at, location_label, target_folder
+                FROM media_items
+                WHERE job_id = ? AND target_folder LIKE '01_Recuerdos/%'
+                ORDER BY target_folder ASC, COALESCE(captured_at, '') ASC, COALESCE(sha256, '') ASC, source_path ASC
+                """,
+                (jid,),
+            ).fetchall()
+
+            by_folder: dict[str, list[Any]] = {}
+            for r in rows:
+                by_folder.setdefault(str(r["target_folder"]), []).append(r)
+
+            all_folders = list(by_folder.keys())
+            now_iso = datetime.now(_tz.utc).isoformat()
+            with conn:
+                if not resume:
+                    for f in all_folders:
+                        conn.execute(
+                            """
+                            INSERT INTO folder_debate_state (job_id, folder, status, history_json, updated_at)
+                            VALUES (?, ?, 'pending', '[]', ?)
+                            ON CONFLICT(job_id, folder) DO UPDATE SET
+                                status = 'pending',
+                                history_json = '[]',
+                                updated_at = excluded.updated_at
+                            """,
+                            (jid, f, now_iso),
+                        )
+                else:
+                    for f in all_folders:
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO folder_debate_state (job_id, folder, status, history_json, updated_at)
+                            VALUES (?, ?, 'pending', '[]', ?)
+                            """,
+                            (jid, f, now_iso),
+                        )
+
+            state_rows = conn.execute(
+                "SELECT folder, status FROM folder_debate_state WHERE job_id = ?",
+                (jid,),
+            ).fetchall()
+            status_by_folder = {str(sr["folder"]): str(sr["status"]) for sr in state_rows}
+        finally:
+            conn.close()
+
+        pending_folders = [f for f in all_folders if status_by_folder.get(f, "pending") != "debated"]
+        total_count = len(all_folders)
+        debated_count = total_count - len(pending_folders)
+
+        batch_size = 5
+        paused_reason: str | None = None
+
+        for i in range(0, len(pending_folders), batch_size):
+            batch_folders = pending_folders[i : i + batch_size]
+            batch_summaries: list[dict[str, Any]] = []
+            for folder in batch_folders:
+                items = by_folder[folder]
+                img_items = [it for it in items if str(it["ext"]).lower() not in VIDEO_EXTENSIONS]
+                sample_paths: list[str] = []
+                thumb_path_str = ""
+                if img_items:
+                    idxs = sorted({0, len(img_items) // 2, min(len(img_items) - 1, (len(img_items) * 3) // 4)})
+                    for s_idx in idxs:
+                        it = img_items[s_idx]
+                        tp = self.thumbs.get_or_create_resized(
+                            str(it["id"]),
+                            Path(str(it["source_path"])),
+                            sha256=it["sha256"],
+                            max_dim=320,
+                        )
+                        sample_paths.append(str(tp))
+                    thumb_path_str = sample_paths[0]
+                loc_label = next((str(it["location_label"]) for it in items if it["location_label"]), None)
+                dates = [str(it["captured_at"]) for it in items if it["captured_at"]]
+                batch_summaries.append(
+                    {
+                        "folder": folder,
+                        "count": len(items),
+                        "start_date": min(dates) if dates else None,
+                        "end_date": max(dates) if dates else None,
+                        "location_label": loc_label,
+                        "thumb_path": thumb_path_str,
+                        "thumb_paths": sample_paths,
+                    }
+                )
+
+            res = debate_folder_batch_with_agy(
+                batch_summaries,
+                cli_command=cli_cmd,
+                model=model,
+                timeout=60.0,
+                people_dir=self.cfg.people_dir,
+            )
+            if not res.get("ok"):
+                paused_reason = str(res.get("error_reason") or "Error de cuota o autenticación en agy")
+                export_portable_plan(self.cfg.db_path, jid, dest_dir)
+                return {
+                    "job_id": jid,
+                    "status": "paused",
+                    "paused": True,
+                    "pause_reason": paused_reason,
+                    "completed_folders": debated_count,
+                    "total_folders": total_count,
+                    "pending_folders": total_count - debated_count,
+                    "progress_label": f"{debated_count}/{total_count} carpetas listas",
+                    "can_resume": True,
+                    "engine": f"agy · {model}",
+                }
+
+            decisions = res.get("decisions", [])
+            conn = open_connection(self.cfg.db_path)
+            try:
+                touched: set[str] = set()
+                batch_ts = datetime.now(_tz.utc).isoformat()
+                with conn:
+                    for dec in decisions:
+                        old_folder = str(dec.get("folder") or "")
+                        if not old_folder:
+                            continue
+                        final_name = str(dec.get("final_name") or "").strip()
+                        merge_with = dec.get("merge_with")
+                        new_folder = old_folder
+                        if merge_with and isinstance(merge_with, str) and merge_with.strip():
+                            new_folder = merge_with.strip()
+                        elif final_name:
+                            parts = old_folder.split("/")
+                            if len(parts) >= 3:
+                                prefix = parts[2].split(" - ")[0]
+                                new_folder = f"{parts[0]}/{parts[1]}/{prefix} - {final_name}"
+                        if new_folder != old_folder:
+                            conn.execute(
+                                "UPDATE media_items SET target_folder = ? WHERE job_id = ? AND target_folder = ?",
+                                (new_folder, jid, old_folder),
+                            )
+                            conn.execute(
+                                "DELETE FROM folder_debate_state WHERE job_id = ? AND folder = ?",
+                                (jid, old_folder),
+                            )
+                            touched.add(new_folder)
+
+                        hist_entry = [
+                            {
+                                "curador": dec.get("curador"),
+                                "auditor": new_folder,
+                                "reason": dec.get("reason"),
+                            }
+                        ]
+                        conn.execute(
+                            """
+                            INSERT INTO folder_debate_state (job_id, folder, status, history_json, updated_at)
+                            VALUES (?, ?, 'debated', ?, ?)
+                            ON CONFLICT(job_id, folder) DO UPDATE SET
+                                status = 'debated',
+                                history_json = excluded.history_json,
+                                updated_at = excluded.updated_at
+                            """,
+                            (jid, new_folder, json.dumps(hist_entry, ensure_ascii=False), batch_ts),
+                        )
+                        debated_count += 1
+
+                    for tf in sorted(touched):
+                        recompute_filenames(conn, jid, tf)
+            finally:
+                conn.close()
+
+            # Atomic checkpoint after each batch of 5
+            export_portable_plan(self.cfg.db_path, jid, dest_dir)
+
+        plan_res = export_portable_plan(self.cfg.db_path, jid, dest_dir)
+        return {
+            "job_id": jid,
+            "status": "completed",
+            "paused": False,
+            "completed_folders": debated_count,
+            "total_folders": total_count,
+            "pending_folders": max(0, total_count - debated_count),
+            "progress_label": f"{debated_count}/{total_count} carpetas listas",
+            "can_resume": False,
+            "plan_path": plan_res["plan_path"],
+            "engine": f"agy · {model}",
+        }
+
 
 if FASTAPI_AVAILABLE:
 
@@ -1143,6 +1388,18 @@ if FASTAPI_AVAILABLE:
     class OpenDestinationRequest(BaseModel):
         job_id: str | None = None
         path: str | None = None
+
+    class PlanExportRequest(BaseModel):
+        job_id: str | None = None
+
+    class PlanImportRequest(BaseModel):
+        job_id: str | None = None
+        plan: dict[str, Any] | None = None
+        plan_path: str | None = None
+
+    class AIDebateRequest(BaseModel):
+        job_id: str | None = None
+        resume: bool = False
 
 
 def create_app(config: OrganizerConfig | None = None) -> Any:
@@ -1325,6 +1582,43 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
     async def ai_tree_apply(payload: AITreeApplyRequest) -> dict[str, Any]:
         return await asyncio.to_thread(core.apply_ai_tree_suggestions, payload.job_id, payload.suggestions)
 
+    @app.get("/api/tree/plan/export")
+    async def export_plan_get(job_id: str | None = None) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(core.export_tree_plan, job_id)
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/api/tree/plan/export")
+    async def export_plan_post(payload: PlanExportRequest | None = None) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(core.export_tree_plan, payload.job_id if payload else None)
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/api/tree/plan/import")
+    async def import_plan_post(payload: PlanImportRequest) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                core.import_tree_plan,
+                payload.job_id,
+                payload.plan,
+                payload.plan_path,
+            )
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/api/tree/ai-debate")
+    async def ai_debate(payload: AIDebateRequest) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                core.run_ai_debate,
+                payload.job_id,
+                resume=payload.resume,
+            )
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
     @app.post("/api/ai/cancel")
     async def ai_cancel() -> dict[str, Any]:
         return core.cancel_ai()
@@ -1447,6 +1741,10 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                     page = int(qs.get("page", ["1"])[0])
                     page_size = int(qs.get("page_size", ["50"])[0])
                     self._send_json(200, core.get_tree(job_id, folder, page, page_size))
+                elif path == "/api/tree/plan/export":
+                    qs = parse_qs(parsed.query)
+                    job_id = qs.get("job_id", [None])[0]
+                    self._send_json(200, core.export_tree_plan(job_id))
                 elif path.startswith("/api/thumbnails/"):
                     item_id = path.rsplit("/", 1)[-1]
                     data = core.get_thumbnail(item_id)
@@ -1547,6 +1845,25 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                         core.apply_ai_tree_suggestions(
                             body["job_id"],
                             body.get("suggestions", []),
+                        ),
+                    )
+                elif path == "/api/tree/plan/export":
+                    self._send_json(200, core.export_tree_plan(body.get("job_id")))
+                elif path == "/api/tree/plan/import":
+                    self._send_json(
+                        200,
+                        core.import_tree_plan(
+                            body.get("job_id"),
+                            body.get("plan"),
+                            body.get("plan_path"),
+                        ),
+                    )
+                elif path == "/api/tree/ai-debate":
+                    self._send_json(
+                        200,
+                        core.run_ai_debate(
+                            body.get("job_id"),
+                            resume=bool(body.get("resume", False)),
                         ),
                     )
                 elif path == "/api/ai/cancel":

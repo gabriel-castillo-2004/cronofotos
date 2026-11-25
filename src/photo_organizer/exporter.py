@@ -7,11 +7,12 @@ import os
 import shutil
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from photo_organizer.config import IGNORED_SIDECAR_EXTENSIONS, to_win_long_path
-from photo_organizer.db import open_connection
+from photo_organizer.db import open_connection, recompute_filenames
 from photo_organizer.media import MediaMetadataService
 from photo_organizer.worker import (
     MASTER_INDEX_FILENAME,
@@ -25,6 +26,211 @@ from photo_organizer.worker import (
 OMITTED_ROUTE_REASONS: frozenset[str] = frozenset(
     {"already_in_library", "ya respaldado en índice maestro"}
 )
+
+PORTABLE_PLAN_FILENAME = "_cronofotos_plan.json"
+
+
+def save_portable_plan_atomic(plan_path: Path, plan_data: dict[str, Any]) -> Path:
+    """Atomically write _cronofotos_plan.json via a .tmp file and os.replace."""
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = plan_path.parent / f"{plan_path.name}.tmp"
+    payload = json.dumps(plan_data, ensure_ascii=False, indent=2)
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(str(tmp_path), str(plan_path))
+    return plan_path
+
+
+def build_portable_plan(db_path: Path, job_id: str) -> dict[str, Any]:
+    """Build the portable tree plan dictionary from SQLite without touching media files."""
+    conn = open_connection(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT sha256, target_folder, is_duplicate
+            FROM media_items
+            WHERE job_id = ? AND sha256 IS NOT NULL AND sha256 != ''
+            ORDER BY is_duplicate ASC, target_folder ASC, target_filename ASC
+            """,
+            (job_id,),
+        ).fetchall()
+
+        files_map: dict[str, str] = {}
+        all_folders: set[str] = set()
+        for r in rows:
+            sha = str(r["sha256"])
+            folder = str(r["target_folder"])
+            all_folders.add(folder)
+            if sha not in files_map:
+                files_map[sha] = folder
+
+        debate_rows = conn.execute(
+            """
+            SELECT folder, status, history_json
+            FROM folder_debate_state
+            WHERE job_id = ?
+            ORDER BY folder ASC
+            """,
+            (job_id,),
+        ).fetchall()
+
+        folders_state: dict[str, dict[str, Any]] = {}
+        debate_history: list[dict[str, Any]] = []
+        for dr in debate_rows:
+            f_name = str(dr["folder"])
+            st = str(dr["status"] or "pending")
+            try:
+                hist = json.loads(dr["history_json"] or "[]")
+                if not isinstance(hist, list):
+                    hist = []
+            except json.JSONDecodeError:
+                hist = []
+            folders_state[f_name] = {
+                "status": st,
+                "state": st,
+                "history": hist,
+            }
+            for entry in hist:
+                if isinstance(entry, dict):
+                    debate_history.append({"folder": f_name, **entry})
+
+        for f_name in sorted(all_folders):
+            if f_name not in folders_state:
+                folders_state[f_name] = {
+                    "status": "pending",
+                    "state": "pending",
+                    "history": [],
+                }
+
+        return {
+            "version": 1,
+            "job_id": job_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "files": files_map,
+            "folders": folders_state,
+            "debate_history": debate_history,
+        }
+    finally:
+        conn.close()
+
+
+def export_portable_plan(
+    db_path: Path,
+    job_id: str,
+    dest_dir: Path,
+) -> dict[str, Any]:
+    """Export the full tree plan to dest_dir/_cronofotos_plan.json atomically."""
+    plan_data = build_portable_plan(db_path, job_id)
+    plan_path = dest_dir / PORTABLE_PLAN_FILENAME
+    save_portable_plan_atomic(plan_path, plan_data)
+    return {
+        "job_id": job_id,
+        "plan_path": str(plan_path),
+        "file_count": len(plan_data["files"]),
+        "folder_count": len(plan_data["folders"]),
+        "plan": plan_data,
+    }
+
+
+def _extract_sha_folder_pairs(plan_data: dict[str, Any]) -> dict[str, str]:
+    """Extract sha256 -> target_folder mapping from a portable plan dict."""
+    mapping: dict[str, str] = {}
+    files_obj = plan_data.get("files") or plan_data.get("sha256_map") or plan_data.get("items")
+    if isinstance(files_obj, dict):
+        for sha, val in files_obj.items():
+            if isinstance(val, str) and val.strip():
+                mapping[str(sha)] = val.strip()
+            elif isinstance(val, dict):
+                for key in ("target_folder", "folder", "carpeta_destino", "dest_folder"):
+                    if isinstance(val.get(key), str) and val[key].strip():
+                        mapping[str(sha)] = val[key].strip()
+                        break
+    elif isinstance(files_obj, list):
+        for item in files_obj:
+            if not isinstance(item, dict):
+                continue
+            sha = item.get("sha256")
+            if not sha:
+                continue
+            for key in ("target_folder", "folder", "carpeta_destino", "dest_folder"):
+                if isinstance(item.get(key), str) and item[key].strip():
+                    mapping[str(sha)] = item[key].strip()
+                    break
+    return mapping
+
+
+def import_portable_plan(
+    db_path: Path,
+    job_id: str,
+    plan_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Restore sha256->folder mappings, folder states, and debate history into SQLite."""
+    sha_map = _extract_sha_folder_pairs(plan_data)
+    folders_obj = plan_data.get("folders")
+    debate_history = plan_data.get("debate_history")
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    history_by_folder: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(debate_history, list):
+        for entry in debate_history:
+            if isinstance(entry, dict) and entry.get("folder"):
+                history_by_folder.setdefault(str(entry["folder"]), []).append(entry)
+
+    updated_items = 0
+    touched_folders: set[str] = set()
+    folders_synced = 0
+
+    conn = open_connection(db_path)
+    try:
+        with conn:
+            for sha, target_folder in sha_map.items():
+                cur = conn.execute(
+                    """
+                    UPDATE media_items
+                    SET target_folder = ?
+                    WHERE job_id = ? AND sha256 = ? AND target_folder != ?
+                    """,
+                    (target_folder, job_id, sha, target_folder),
+                )
+                if cur.rowcount > 0:
+                    updated_items += cur.rowcount
+                    touched_folders.add(target_folder)
+
+            for folder in sorted(touched_folders):
+                recompute_filenames(conn, job_id, folder)
+
+            if isinstance(folders_obj, dict):
+                for folder_name, meta in folders_obj.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    st = str(meta.get("status") or meta.get("state") or "pending").strip().lower()
+                    if st not in ("pending", "debated"):
+                        st = "pending"
+                    hist = meta.get("history")
+                    if not isinstance(hist, list):
+                        hist = history_by_folder.get(str(folder_name), [])
+                    conn.execute(
+                        """
+                        INSERT INTO folder_debate_state (job_id, folder, status, history_json, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(job_id, folder) DO UPDATE SET
+                            status = excluded.status,
+                            history_json = excluded.history_json,
+                            updated_at = excluded.updated_at
+                        """,
+                        (job_id, str(folder_name), st, json.dumps(hist, ensure_ascii=False), now_iso),
+                    )
+                    folders_synced += 1
+    finally:
+        conn.close()
+
+    return {
+        "job_id": job_id,
+        "updated_items": updated_items,
+        "folders_synced": folders_synced,
+    }
 
 
 def cleanup_orphaned_tmp_files(dest_dir: Path) -> int:

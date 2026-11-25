@@ -84,6 +84,16 @@ CREATE TABLE IF NOT EXISTS custom_folders (
     PRIMARY KEY (job_id, folder),
     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS folder_debate_state (
+    job_id TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    history_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, folder),
+    FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
 """
 
 
