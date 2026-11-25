@@ -845,7 +845,7 @@ class _LocalAppCore:
                             cli_command=cli_cmd,
                             model=model,
                             cancel_event=self._ai_cancel_event,
-                            people_dir=self.cfg.people_dir,
+                            people_dir=None if _has_fc else self.cfg.people_dir,
                             add_dirs=add_dirs,
                             error_out=err_info,
                         )
