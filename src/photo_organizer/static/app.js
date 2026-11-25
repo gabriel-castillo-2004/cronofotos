@@ -269,14 +269,93 @@ async function loadTree() {
     li.setAttribute("role", "treeitem");
     li.setAttribute("aria-selected", isActive ? "true" : "false");
     li.tabIndex = 0;
-    li.textContent = `${f.folder} (${f.count})`;
+
+    const labelSpan = document.createElement("span");
+    labelSpan.className = "folder-label";
+    labelSpan.textContent = `${f.folder} (${f.count})`;
+
+    const renameBtn = document.createElement("button");
+    renameBtn.type = "button";
+    renameBtn.className = "btn-inline-rename";
+    renameBtn.title = "Renombrar carpeta";
+    renameBtn.setAttribute("aria-label", `Renombrar ${f.folder}`);
+    renameBtn.textContent = "✏️";
+
     const selectFolder = () => {
       state.selectedFolder = f.folder;
       state.page = 1;
       loadTree();
     };
+
+    renameBtn.onclick = (e) => {
+      e.stopPropagation();
+      if (!state.jobId || li.querySelector(".inline-rename-input")) return;
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "inline-rename-input";
+      input.value = f.folder;
+      input.setAttribute("aria-label", `Nuevo nombre para ${f.folder}`);
+
+      const restoreLabel = () => {
+        if (input.parentNode === li) {
+          li.replaceChild(labelSpan, input);
+        }
+        renameBtn.classList.remove("hidden");
+      };
+
+      let committed = false;
+      const commitRename = async () => {
+        if (committed) return;
+        committed = true;
+        const next = input.value.trim();
+        if (!next || next === f.folder) {
+          restoreLabel();
+          return;
+        }
+        input.disabled = true;
+        try {
+          await api("/api/tree/folders/rename", "POST", {
+            job_id: state.jobId,
+            old_folder: f.folder,
+            new_folder: next,
+          });
+          if (state.selectedFolder === f.folder) {
+            state.selectedFolder = next;
+          }
+          logActivity(`Carpeta renombrada: ${f.folder} -> ${next}`);
+          await loadTree();
+        } catch (err) {
+          showToast(`Error al renombrar carpeta: ${err.message}`, "warn");
+          logActivity(`Error al renombrar carpeta: ${err.message}`);
+          restoreLabel();
+        }
+      };
+
+      input.onclick = (ev) => ev.stopPropagation();
+      input.onkeydown = (ev) => {
+        ev.stopPropagation();
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          commitRename();
+        } else if (ev.key === "Escape") {
+          ev.preventDefault();
+          committed = true;
+          restoreLabel();
+        }
+      };
+      input.onblur = () => commitRename();
+
+      renameBtn.classList.add("hidden");
+      li.replaceChild(input, labelSpan);
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    };
+
+    li.appendChild(labelSpan);
+    li.appendChild(renameBtn);
     li.onclick = selectFolder;
     li.onkeydown = (e) => {
+      if (e.target && e.target.tagName === "INPUT") return;
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
         selectFolder();
@@ -707,11 +786,12 @@ function bindEvents() {
       logActivity("Analizando estructura y miniaturas con IA...");
       try {
         const res = await api("/api/tree/ai-suggestions", "POST", { job_id: state.jobId });
-        renderAiSuggestions(res.suggestions || [], res.engine || "Fallback local");
+        const engineLabel = res.engine || "Fallback local";
+        renderAiSuggestions(res.suggestions || [], engineLabel);
         const count = (res.suggestions || []).length;
-        const msg = `Análisis completado (${count} sugerencias · ${res.engine || "Fallback local"}).`;
+        const msg = `Análisis completado (${count} sugerencias · ${engineLabel}).`;
         $("progress-stage").textContent = `Estado: ${msg}`;
-        showToast(msg, "ok");
+        showToast(msg, engineLabel.toLowerCase().includes("fallback") ? "warn" : "ok");
         logActivity(msg);
       } catch (err) {
         showToast(`Error al analizar árbol: ${err.message}`, "warn");

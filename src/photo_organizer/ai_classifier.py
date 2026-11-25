@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -608,6 +611,69 @@ def _deterministic_tree_suggestions(folder_summaries: list[dict[str, Any]]) -> l
     return suggestions
 
 
+def _select_representative_thumb_paths(folder_info: dict[str, Any], limit: int = 3) -> list[Path]:
+    """Pick up to `limit` representative thumbnail paths (start, mid, 75%) for a folder."""
+    raw_list = folder_info.get("thumb_paths")
+    candidates: list[Path] = []
+    if isinstance(raw_list, (list, tuple)):
+        for item in raw_list:
+            if item:
+                p = Path(str(item))
+                if p.exists() and p.is_file():
+                    candidates.append(p)
+    if not candidates and folder_info.get("thumb_path"):
+        p = Path(str(folder_info["thumb_path"]))
+        if p.exists() and p.is_file():
+            candidates.append(p)
+    if not candidates:
+        return []
+    if len(candidates) <= limit:
+        seen: set[Path] = set()
+        unique: list[Path] = []
+        for p in candidates:
+            if p not in seen:
+                seen.add(p)
+                unique.append(p)
+        return unique
+
+    indices = [0, len(candidates) // 2, min(len(candidates) - 1, (len(candidates) * 3) // 4)]
+    selected: list[Path] = []
+    seen_idx: set[int] = set()
+    for idx in indices:
+        if idx not in seen_idx:
+            seen_idx.add(idx)
+            selected.append(candidates[idx])
+    return selected[:limit]
+
+
+def _prepare_temp_thumb(src: Path, dst: Path, max_dim: int = 320) -> Path:
+    """Save a <=320px JPEG copy into `dst` (falling back to raw copy if image decode fails)."""
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(src) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            elif img.mode == "L":
+                img = img.convert("RGB")
+            img.thumbnail((max_dim, max_dim))
+            img.save(dst, format="JPEG", quality=82, optimize=True)
+            return dst
+    except Exception:
+        shutil.copy2(src, dst)
+        return dst
+
+
+def _summarize_failure_reason(raw: str, max_len: int = 140) -> str:
+    """Return a concise single-line technical failure reason."""
+    lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    msg = re.sub(r"\s+", " ", lines[0])
+    return msg[:max_len]
+
+
 def suggest_tree_optimizations(
     folder_summaries: list[dict[str, Any]],
     *,
@@ -617,7 +683,7 @@ def suggest_tree_optimizations(
     cancel_event: threading.Event | None = None,
     forbid_fixed_labels: bool = False,
 ) -> dict[str, Any]:
-    """Analyze folder metadata + <=256px representative thumbnails in batches of <=12 via agy."""
+    """Analyze folder metadata + up to 3 <=320px representative thumbnails per folder via agy."""
     if not folder_summaries:
         return {"engine": "Fallback determinista local", "suggestions": []}
 
@@ -629,50 +695,80 @@ def suggest_tree_optimizations(
     can_call_agy = resolved_bin is not None or (
         subprocess.run is not _ORIG_SUBPROCESS_RUN and is_standard_agy_binary(cmd_bin)
     )
-    if not can_call_agy or (cancel_event is not None and cancel_event.is_set()):
+    if cancel_event is not None and cancel_event.is_set():
+        reason = "operación cancelada"
         return {
-            "engine": "Fallback determinista local",
+            "engine": f"Fallback determinista local ({reason})",
+            "error_reason": reason,
+            "suggestions": _deterministic_tree_suggestions(folder_summaries),
+        }
+    if not can_call_agy:
+        reason = f"binario '{cmd_bin}' no encontrado"
+        return {
+            "engine": f"Fallback determinista local ({reason})",
+            "error_reason": reason,
             "suggestions": _deterministic_tree_suggestions(folder_summaries),
         }
 
     batch_size = 12
     all_suggestions: list[dict[str, Any]] = []
-    agy_failed = False
+    failure_reason: str | None = None
 
     for i in range(0, len(folder_summaries), batch_size):
         if cancel_event is not None and cancel_event.is_set():
-            agy_failed = True
+            failure_reason = "operación cancelada"
             break
         chunk = folder_summaries[i : i + batch_size]
-        thumb_dirs = [
-            str(Path(str(f["thumb_path"])).parent)
-            for f in chunk
-            if f.get("thumb_path") and Path(str(f["thumb_path"])).exists()
-        ]
-        add_dir: str | None = None
-        if thumb_dirs:
-            try:
-                common = Path(os.path.commonpath(thumb_dirs))
-                add_dir = str(common) if common.exists() else thumb_dirs[0]
-            except ValueError:
-                add_dir = thumb_dirs[0]
 
-        compact = [
-            {
-                "folder": f.get("folder"),
-                "count": f.get("count"),
-                "start_date": f.get("start_date"),
-                "end_date": f.get("end_date"),
-                "location": f.get("location_label"),
-                "max_gap_hours": f.get("max_gap_hours"),
-                "is_midnight_merged": bool(f.get("is_midnight_merged", False)),
-                "thumbnail": f.get("thumb_path"),
-            }
-            for f in chunk
-        ]
+        tmp_dir = tempfile.mkdtemp(prefix="agy_thumbs_")
+        atexit.register(shutil.rmtree, tmp_dir, True)
+        tmp_root = Path(tmp_dir)
+        compact: list[dict[str, Any]] = []
+        has_prepared_thumbs = False
+
+        for f_idx, f in enumerate(chunk):
+            rep_srcs = _select_representative_thumb_paths(f, limit=3)
+            prepared_paths: list[str] = []
+            for t_idx, src_p in enumerate(rep_srcs):
+                dst_p = tmp_root / f"folder_{f_idx:02d}_thumb_{t_idx + 1}.jpg"
+                _prepare_temp_thumb(src_p, dst_p, max_dim=320)
+                prepared_paths.append(str(dst_p))
+                has_prepared_thumbs = True
+
+            compact.append(
+                {
+                    "folder": f.get("folder"),
+                    "count": f.get("count"),
+                    "start_date": f.get("start_date"),
+                    "end_date": f.get("end_date"),
+                    "location": f.get("location_label"),
+                    "max_gap_hours": f.get("max_gap_hours"),
+                    "is_midnight_merged": bool(f.get("is_midnight_merged", False)),
+                    "thumbnails": prepared_paths if prepared_paths else ([f.get("thumb_path")] if f.get("thumb_path") else []),
+                }
+            )
+
+        add_dir: str | None = str(tmp_root) if has_prepared_thumbs else None
+        if add_dir is None:
+            thumb_dirs = [
+                str(Path(str(f["thumb_path"])).parent)
+                for f in chunk
+                if f.get("thumb_path") and Path(str(f["thumb_path"])).exists()
+            ]
+            if thumb_dirs:
+                try:
+                    common = Path(os.path.commonpath(thumb_dirs))
+                    add_dir = str(common) if common.exists() else thumb_dirs[0]
+                except ValueError:
+                    add_dir = thumb_dirs[0]
+
         prompt = (
-            "Analiza estas carpetas (máximo 12 por lote) inspeccionando las miniaturas desde disco "
-            "en el directorio adjunto y responde ÚNICAMENTE con JSON válido "
+            "Lee directamente desde disco los archivos de imagen adjuntos en el directorio (--add-dir) "
+            "para cada carpeta (hasta 3 miniaturas por carpeta: inicio, mitad y 75%) "
+            "para identificar la actividad, evento, recinto o artista visible "
+            "(ej. 'Concierto de Luis Miguel', 'Cena Familiar', 'Senderismo en Montaña') "
+            "y propón sugerencias `rename` enriqueciendo el nombre actual de la carpeta aunque ya tenga ubicación GPS. "
+            "Analiza estas carpetas (máximo 12 por lote) y responde ÚNICAMENTE con JSON válido "
             '{"suggestions": [{"type": "rename|merge|split", "before": ..., "after": ..., "reason": "..."}]}. '
             "Reglas: usa títulos descriptivos reales en español según lo que se ve en cada imagen; "
             "NUNCA uses etiquetas fijas como 'Sesión Mañana' o 'Sesión Tarde'; "
@@ -691,8 +787,16 @@ def suggest_tree_optimizations(
                 timeout=timeout,
                 check=False,
             )
-            if proc.returncode != 0 or not proc.stdout:
-                agy_failed = True
+            if proc.returncode != 0:
+                detail = _summarize_failure_reason(proc.stderr or proc.stdout)
+                failure_reason = (
+                    f"código {proc.returncode}: {detail}" if detail else f"código {proc.returncode}"
+                )
+                logger.warning("agy falló (%s)", failure_reason)
+                break
+            if not proc.stdout or not proc.stdout.strip():
+                failure_reason = "salida vacía de agy"
+                logger.warning("agy devolvió salida vacía")
                 break
             parsed = _parse_suggestions_json(
                 proc.stdout,
@@ -700,17 +804,21 @@ def suggest_tree_optimizations(
                 forbid_fixed_labels=forbid_fixed_labels,
             )
             if parsed is None:
-                agy_failed = True
+                snippet = _summarize_failure_reason(proc.stdout, max_len=80)
+                failure_reason = f"salida JSON inválida de agy ({snippet})" if snippet else "salida JSON inválida de agy"
+                logger.warning("agy devolvió salida JSON inválida: %s", snippet)
                 break
             all_suggestions.extend(parsed)
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            detail = _summarize_failure_reason(str(exc))
+            failure_reason = f"error ejecutando agy: {detail}" if detail else "error ejecutando agy"
             logger.warning("Fallo al consultar agy para optimización de árbol: %s", exc)
-            agy_failed = True
             break
 
-    if agy_failed:
+    if failure_reason is not None:
         return {
-            "engine": "Fallback determinista local",
+            "engine": f"Fallback determinista local ({failure_reason})",
+            "error_reason": failure_reason,
             "suggestions": _deterministic_tree_suggestions(folder_summaries),
         }
     return {
