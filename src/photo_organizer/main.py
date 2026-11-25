@@ -12,10 +12,15 @@ import http.server
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import uuid
+from email.parser import BytesParser
+from email.policy import default as email_default_policy
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -31,6 +36,7 @@ from photo_organizer.ai_classifier import (
 from photo_organizer.clustering import offline_reverse_geocode
 from photo_organizer.config import (
     AGY_ALLOWED_NAMES,
+    PEOPLE_IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
     OrganizerConfig,
     is_standard_agy_binary,
@@ -41,7 +47,7 @@ from photo_organizer.config import (
 from photo_organizer.db import init_db, open_connection, recompute_filenames
 from photo_organizer.exporter import run_two_phase_export
 from photo_organizer.media import BinaryHealthCheck, MediaMetadataService
-from photo_organizer.thumbnails import ThumbnailCache
+from photo_organizer.thumbnails import ThumbnailCache, extract_top_face_crops
 from photo_organizer.worker import PipelineOrchestrator
 
 try:
@@ -56,6 +62,33 @@ except ImportError:  # pragma: no cover - exercised when fastapi is not installe
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "testserver"}
+
+
+def _parse_multipart_form(
+    content_type: str,
+    body: bytes,
+) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+    """Parse multipart/form-data payload using Python stdlib email parser."""
+    if "multipart/form-data" not in (content_type or "").lower():
+        raise _ApiError(400, "Se requiere Content-Type multipart/form-data")
+    header_blob = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("latin-1")
+    msg = BytesParser(policy=email_default_policy).parsebytes(header_blob + body)
+    fields: dict[str, str] = {}
+    files: dict[str, tuple[str, bytes]] = {}
+    if not msg.is_multipart():
+        raise _ApiError(400, "Cuerpo multipart inválido")
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+        if filename is not None:
+            files[str(name)] = (str(filename), payload)
+        else:
+            charset = part.get_content_charset() or "utf-8"
+            fields[str(name)] = payload.decode(charset, errors="replace")
+    return fields, files
 
 
 class _ApiError(Exception):
@@ -465,6 +498,95 @@ class _LocalAppCore:
             cancel_event=self._ai_cancel_event,
         )
 
+    def _people_dir(self) -> Path:
+        return self.cfg.people_dir
+
+    def _read_people_index(self) -> list[dict[str, Any]]:
+        pdir = self._people_dir()
+        idx_path = pdir / "people.json"
+        if not idx_path.is_file():
+            return []
+        try:
+            raw = json.loads(idx_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, list):
+                return []
+        except (OSError, json.JSONDecodeError):
+            return []
+        valid: list[dict[str, Any]] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            fname = str(entry.get("filename") or "")
+            if fname and (pdir / fname).is_file():
+                valid.append(entry)
+        return valid
+
+    def _write_people_index(self, entries: list[dict[str, Any]]) -> None:
+        pdir = self._people_dir()
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / "people.json").write_text(
+            json.dumps(entries, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def list_people(self) -> dict[str, Any]:
+        return {"people": self._read_people_index()}
+
+    def add_person(self, label: str, filename: str, data: bytes) -> dict[str, Any]:
+        clean_label = (label or "").strip()
+        if not clean_label:
+            raise _ApiError(400, "La etiqueta de la persona es obligatoria")
+        if not data:
+            raise _ApiError(400, "El archivo de imagen está vacío")
+        ext = Path(filename or "foto.jpg").suffix.lower() or ".jpg"
+        if ext not in PEOPLE_IMAGE_EXTENSIONS:
+            raise _ApiError(400, f"Formato de imagen no soportado: {ext}")
+
+        pdir = self._people_dir()
+        pdir.mkdir(parents=True, exist_ok=True)
+        person_id = uuid.uuid4().hex[:12]
+        slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", clean_label).strip("_") or "persona"
+        stored_name = f"{slug}__{person_id}{ext}"
+        (pdir / stored_name).write_bytes(data)
+
+        entry = {
+            "id": person_id,
+            "label": clean_label,
+            "filename": stored_name,
+            "url": f"/api/people/{person_id}/image",
+        }
+        entries = self._read_people_index()
+        entries.append(entry)
+        self._write_people_index(entries)
+        return {"person": entry, **entry}
+
+    def delete_person(self, person_id: str) -> dict[str, Any]:
+        entries = self._read_people_index()
+        target = next((e for e in entries if str(e.get("id")) == person_id), None)
+        if target is None:
+            raise _ApiError(404, "Persona no encontrada")
+        pdir = self._people_dir()
+        fpath = pdir / str(target.get("filename") or "")
+        if fpath.is_file():
+            try:
+                fpath.unlink()
+            except OSError:
+                pass
+        remaining = [e for e in entries if str(e.get("id")) != person_id]
+        self._write_people_index(remaining)
+        return {"deleted": True, "id": person_id}
+
+    def get_person_image(self, person_id: str) -> tuple[bytes, str]:
+        entries = self._read_people_index()
+        target = next((e for e in entries if str(e.get("id")) == person_id), None)
+        if target is None:
+            raise _ApiError(404, "Persona no encontrada")
+        fpath = self._people_dir() / str(target.get("filename") or "")
+        if not fpath.is_file():
+            raise _ApiError(404, "Imagen de referencia no encontrada")
+        ctype, _ = mimetypes.guess_type(str(fpath))
+        return fpath.read_bytes(), (ctype or "image/jpeg")
+
     def regenerate_ai_names(self, job_id: str) -> dict[str, Any]:
         """Invalidate AI name cache and re-run AI folder naming on 01_Recuerdos/ folders."""
         self._ai_cancel_event.clear()
@@ -475,6 +597,7 @@ class _LocalAppCore:
         cli_cmd = self.state["antigravity_cli"]
         model = self.state["model"]
         agy_available = bool(resolve_cli_binary(cli_cmd, allowed_names=AGY_ALLOWED_NAMES))
+        last_error: str | None = None
         try:
             with conn:
                 conn.execute("DELETE FROM ai_cache")
@@ -508,12 +631,68 @@ class _LocalAppCore:
                         else ""
                     )
                     summary = f"{ym_prefix} | {row['cnt']} fotos | carpeta: {orig_parent}{gps_txt}"
-                    ai_name = classify_with_agy(
-                        summary,
-                        cli_command=cli_cmd,
-                        model=model,
-                        cancel_event=self._ai_cancel_event,
+
+                    folder_items = conn.execute(
+                        """
+                        SELECT id, source_path, ext, sha256
+                        FROM media_items
+                        WHERE job_id = ? AND target_folder = ?
+                        ORDER BY COALESCE(captured_at, '') ASC, COALESCE(sha256, '') ASC, source_path ASC
+                        """,
+                        (job_id, old_folder),
+                    ).fetchall()
+                    img_items = [
+                        it for it in folder_items if str(it["ext"]).lower() not in VIDEO_EXTENSIONS
+                    ]
+                    scene_indices = (
+                        [0, len(img_items) // 2, min(len(img_items) - 1, (len(img_items) * 3) // 4)]
+                        if img_items
+                        else []
                     )
+                    tmp_scene_dir: str | None = None
+                    add_dirs: list[Path] = []
+                    if scene_indices:
+                        tmp_scene_dir = tempfile.mkdtemp(prefix="agy_regen_")
+                        tmp_scene_path = Path(tmp_scene_dir)
+                        seen_idx: set[int] = set()
+                        for idx in scene_indices:
+                            if idx not in seen_idx:
+                                seen_idx.add(idx)
+                                it = img_items[idx]
+                                tpath = self.thumbs.get_or_create_resized(
+                                    str(it["id"]),
+                                    Path(str(it["source_path"])),
+                                    sha256=it["sha256"],
+                                    max_dim=320,
+                                )
+                                if tpath.is_file():
+                                    (tmp_scene_path / f"scene_{idx}.jpg").write_bytes(tpath.read_bytes())
+                        extract_top_face_crops(
+                            [Path(str(it["source_path"])) for it in img_items[:12]],
+                            tmp_scene_path,
+                            max_faces=4,
+                            file_prefix="face",
+                        )
+                        add_dirs.append(tmp_scene_path)
+
+                    err_info: dict[str, str] = {}
+                    try:
+                        ai_name = classify_with_agy(
+                            summary,
+                            cli_command=cli_cmd,
+                            model=model,
+                            cancel_event=self._ai_cancel_event,
+                            people_dir=self.cfg.people_dir,
+                            add_dirs=add_dirs,
+                            error_out=err_info,
+                        )
+                    finally:
+                        if tmp_scene_dir:
+                            import shutil as _shutil
+
+                            _shutil.rmtree(tmp_scene_dir, ignore_errors=True)
+                    if err_info.get("reason"):
+                        last_error = err_info["reason"]
                     if self._ai_cancel_event.is_set():
                         cancelled = True
                         break
@@ -531,7 +710,7 @@ class _LocalAppCore:
         finally:
             conn.close()
         engine_name = f"agy · {model}" if agy_available else "Fallback local"
-        return {
+        result: dict[str, Any] = {
             "job_id": job_id,
             "updated_folders": updated,
             "total_folders": total_folders,
@@ -541,6 +720,9 @@ class _LocalAppCore:
             "ai_engine": "agy" if agy_available else "heuristica_local",
             "model": model,
         }
+        if last_error:
+            result["error_reason"] = last_error
+        return result
 
     def get_ai_tree_suggestions(self, job_id: str | None = None) -> dict[str, Any]:
         """Build folder summaries + <=256px representative thumbnails and request AI suggestions."""
@@ -588,6 +770,29 @@ class _LocalAppCore:
                 sha256=rep["sha256"],
                 max_dim=256,
             )
+            img_items = [it for it in items if str(it["ext"]).lower() not in VIDEO_EXTENSIONS]
+            sample_paths: list[str] = []
+            if img_items:
+                sample_indices = sorted(
+                    {
+                        0,
+                        len(img_items) // 4,
+                        len(img_items) // 2,
+                        min(len(img_items) - 1, (len(img_items) * 3) // 4),
+                        len(img_items) - 1,
+                    }
+                )
+                for s_idx in sample_indices:
+                    it = img_items[s_idx]
+                    tp = self.thumbs.get_or_create_resized(
+                        str(it["id"]),
+                        Path(str(it["source_path"])),
+                        sha256=it["sha256"],
+                        max_dim=320,
+                    )
+                    sample_paths.append(str(tp))
+            if not sample_paths:
+                sample_paths = [str(thumb_path)]
 
             parsed_dts: list[datetime] = []
             loc_label: str | None = None
@@ -623,6 +828,7 @@ class _LocalAppCore:
                     "max_gap_hours": round(max_gap, 2),
                     "is_midnight_merged": is_midnight_merged,
                     "thumb_path": str(thumb_path),
+                    "thumb_paths": sample_paths,
                 }
             )
 
@@ -632,6 +838,7 @@ class _LocalAppCore:
             model=self.state["model"],
             timeout=60.0,
             cancel_event=self._ai_cancel_event,
+            people_dir=self.cfg.people_dir,
         )
         enriched: list[dict[str, Any]] = []
         for s in res["suggestions"]:
@@ -643,11 +850,14 @@ class _LocalAppCore:
                 item["thumb_item_id"] = rid
                 item["thumb_url"] = f"/api/thumbnails/{rid}"
             enriched.append(item)
-        return {
+        out: dict[str, Any] = {
             "job_id": jid,
             "engine": res["engine"],
             "suggestions": enriched,
         }
+        if res.get("error_reason"):
+            out["error_reason"] = res["error_reason"]
+        return out
 
     def apply_ai_tree_suggestions(
         self,
@@ -938,6 +1148,40 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
     async def update_settings(payload: SettingsUpdateRequest) -> dict[str, Any]:
         return core.update_settings(payload.model_dump())
 
+    @app.get("/api/people")
+    async def list_people() -> dict[str, Any]:
+        return await asyncio.to_thread(core.list_people)
+
+    @app.post("/api/people")
+    async def add_person(request: Request) -> JSONResponse:
+        try:
+            body = await request.body()
+            fields, files = _parse_multipart_form(request.headers.get("content-type", ""), body)
+            label = fields.get("label", "")
+            file_entry = files.get("file") or (next(iter(files.values())) if files else None)
+            if not file_entry:
+                raise _ApiError(400, "Se requiere un archivo de imagen")
+            filename, data = file_entry
+            res = await asyncio.to_thread(core.add_person, label, filename, data)
+            return JSONResponse(status_code=201, content=res)
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.delete("/api/people/{person_id}")
+    async def delete_person(person_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(core.delete_person, person_id)
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.get("/api/people/{person_id}/image")
+    async def get_person_image(person_id: str) -> Response:
+        try:
+            data, ctype = await asyncio.to_thread(core.get_person_image, person_id)
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        return Response(content=data, media_type=ctype)
+
     @app.post("/api/browse-folder")
     async def browse_folder(payload: BrowseFolderRequest | None = None) -> dict[str, Any]:
         initial = payload.initial_dir if payload else None
@@ -1108,11 +1352,17 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
         def _send_json(self, code: int, body: dict[str, Any]) -> None:
             self._send_bytes(code, "application/json; charset=utf-8", json.dumps(body).encode("utf-8"))
 
-        def _read_json(self) -> dict[str, Any]:
+        def _read_raw_body(self) -> bytes:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
+                return b""
+            return self.rfile.read(length)
+
+        def _read_json(self) -> dict[str, Any]:
+            raw_bytes = self._read_raw_body()
+            if not raw_bytes:
                 return {}
-            raw = self.rfile.read(length).decode("utf-8")
+            raw = raw_bytes.decode("utf-8")
             return json.loads(raw) if raw else {}
 
         def _serve_file(self, path: Path) -> None:
@@ -1143,6 +1393,12 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                     self._send_json(200, core.health())
                 elif path == "/api/settings":
                     self._send_json(200, core.get_settings())
+                elif path == "/api/people":
+                    self._send_json(200, core.list_people())
+                elif path.startswith("/api/people/") and path.endswith("/image"):
+                    person_id = path[len("/api/people/") : -len("/image")].strip("/")
+                    data, ctype = core.get_person_image(person_id)
+                    self._send_bytes(200, ctype, data)
                 elif path == "/api/scan/status":
                     self._send_json(200, core.scan_status())
                 elif path == "/api/tree":
@@ -1194,6 +1450,16 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
             parsed = urlparse(self.path)
             path = parsed.path
             try:
+                if path == "/api/people":
+                    raw_body = self._read_raw_body()
+                    fields, files = _parse_multipart_form(self.headers.get("Content-Type", ""), raw_body)
+                    label = fields.get("label", "")
+                    file_entry = files.get("file") or (next(iter(files.values())) if files else None)
+                    if not file_entry:
+                        raise _ApiError(400, "Se requiere un archivo de imagen")
+                    filename, data = file_entry
+                    self._send_json(201, core.add_person(label, filename, data))
+                    return
                 body = self._read_json()
                 if path == "/api/settings":
                     self._send_json(200, core.update_settings(body))
@@ -1271,6 +1537,30 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                 self._send_json(exc.status_code, {"detail": exc.detail})
             except (KeyError, ValueError, json.JSONDecodeError) as exc:
                 self._send_json(400, {"detail": str(exc)})
+            except Exception as exc:
+                self._send_json(500, {"detail": str(exc)})
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            ok, reason = _is_allowed_origin(
+                "DELETE",
+                self.headers.get("Host") or "",
+                self.headers.get("Origin"),
+            )
+            if not ok:
+                self._send_json(403, {"detail": reason})
+                return
+
+            path = urlparse(self.path).path
+            try:
+                if path.startswith("/api/people/"):
+                    person_id = path[len("/api/people/") :].strip("/")
+                    if not person_id or "/" in person_id:
+                        raise _ApiError(404, "Not found")
+                    self._send_json(200, core.delete_person(person_id))
+                else:
+                    self._send_json(404, {"detail": "Not found"})
+            except _ApiError as exc:
+                self._send_json(exc.status_code, {"detail": exc.detail})
             except Exception as exc:
                 self._send_json(500, {"detail": str(exc)})
 

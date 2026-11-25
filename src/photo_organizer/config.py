@@ -64,6 +64,9 @@ IGNORED_SIDECAR_EXTENSIONS: frozenset[str] = frozenset(
     }
 )
 
+PEOPLE_DIR_NAME = "personas_referencia"
+PEOPLE_IMAGE_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+
 
 def normalize_win_path(path: str | Path) -> Path:
     """Normalize a path, supporting Windows '\\\\?\\' extended-length prefixes."""
@@ -206,3 +209,13 @@ class OrganizerConfig:
     gemini_model: str = "gemini-4-hydrogen-medium"
     host: str = "127.0.0.1"
     port: int = 8000
+
+    @property
+    def data_dir(self) -> Path:
+        """Base data directory derived from the SQLite database path."""
+        return self.db_path.parent
+
+    @property
+    def people_dir(self) -> Path:
+        """Directory storing reference photos for key people recognition."""
+        return self.data_dir / PEOPLE_DIR_NAME

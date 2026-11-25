@@ -199,3 +199,76 @@ class ThumbnailCache:
         except OSError:
             pass
         return out_path
+
+
+def extract_top_face_crops(
+    image_paths: list[Path],
+    out_dir: Path,
+    *,
+    max_faces: int = 4,
+    crop_size: int = 192,
+    file_prefix: str = "face",
+) -> list[Path]:
+    """Detect faces via OpenCV CascadeClassifier, sort by bbox area desc, and save top crops."""
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except ImportError:
+        return []
+    if cv2 is None or not hasattr(cv2, "CascadeClassifier"):
+        return []
+
+    try:
+        cascades_dir = getattr(getattr(cv2, "data", None), "haarcascades", "") or ""
+        cascade_path = str(Path(cascades_dir) / "haarcascade_frontalface_default.xml") if cascades_dir else "haarcascade_frontalface_default.xml"
+        classifier = cv2.CascadeClassifier(cascade_path)
+        if classifier is None or (hasattr(classifier, "empty") and classifier.empty()):
+            return []
+    except Exception:
+        return []
+
+    candidates: list[tuple[int, tuple[int, int, int, int], object]] = []
+    for src in image_paths:
+        if not src.exists() or not src.is_file():
+            continue
+        try:
+            img = cv2.imread(str(src))
+            if img is None:
+                continue
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            boxes = classifier.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(20, 20))
+            if boxes is None:
+                continue
+            for box in boxes:
+                x, y, w, h = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                if w > 0 and h > 0:
+                    candidates.append((w * h, (x, y, w, h), img))
+        except Exception:
+            continue
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[Path] = []
+    for idx, (_area, (x, y, w, h), img) in enumerate(candidates[: max(1, max_faces)], start=1):
+        try:
+            shape = getattr(img, "shape", None)
+            if shape and len(shape) >= 2:
+                img_h, img_w = int(shape[0]), int(shape[1])
+                x0 = max(0, x)
+                y0 = max(0, y)
+                x1 = min(img_w, x + w)
+                y1 = min(img_h, y + h)
+            else:
+                x0, y0, x1, y1 = x, y, x + w, y + h
+            if x1 <= x0 or y1 <= y0:
+                continue
+            crop = img[y0:y1, x0:x1]
+            resized = cv2.resize(crop, (crop_size, crop_size))
+            dst = out_dir / f"{file_prefix}_{idx}.jpg"
+            if cv2.imwrite(str(dst), resized):
+                saved.append(dst)
+        except Exception:
+            continue
+    return saved
