@@ -268,6 +268,16 @@ async function loadTree() {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
         selectFolder();
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        if (li.nextElementSibling) {
+          li.nextElementSibling.focus();
+        }
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        if (li.previousElementSibling) {
+          li.previousElementSibling.focus();
+        }
       }
     };
     folderList.appendChild(li);
@@ -409,12 +419,18 @@ function bindEvents() {
     const restore = setActionBusy("btn-start", "Organizando...");
     $("progress-stage").textContent = "Estado: Iniciando organización...";
     logActivity(`Iniciando organización (${solo_primer_lote ? "modo prueba" : "completa"})`);
+    const timeGapEl = $("time-gap-hours");
+    const gpsDistEl = $("gps-distance-km");
+    const time_gap_hours = timeGapEl ? Math.max(0.5, Number(timeGapEl.value) || 4) : 4;
+    const gps_distance_km = gpsDistEl ? Math.max(1, Number(gpsDistEl.value) || 25) : 25;
     try {
       const snap = await api("/api/scan/start", "POST", {
         source_dir,
         dest_dir,
         batch_size,
         solo_primer_lote,
+        time_gap_hours,
+        gps_distance_km,
       });
       updateProgressUI(snap);
       connectSSE();
