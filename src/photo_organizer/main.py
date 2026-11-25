@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from photo_organizer.ai_classifier import DEFAULT_AGY_MODEL, GeminiClassifier
-from photo_organizer.config import OrganizerConfig, validate_source_dest_pair
+from photo_organizer.ai_classifier import DEFAULT_AGY_MODEL, GeminiClassifier, classify_with_agy
+from photo_organizer.config import OrganizerConfig, resolve_cli_binary, validate_source_dest_pair
 from photo_organizer.db import init_db, open_connection, recompute_filenames
 from photo_organizer.exporter import run_two_phase_export
 from photo_organizer.media import BinaryHealthCheck, MediaMetadataService
@@ -76,6 +76,8 @@ class _LocalAppCore:
             cfg.db_path,
             self.media_service,
             max_workers=cfg.max_workers,
+            antigravity_cli=cfg.antigravity_cli or "agy",
+            ai_model=cfg.gemini_model or DEFAULT_AGY_MODEL,
         )
         self.state: dict[str, Any] = {
             "job_task": None,
@@ -141,6 +143,8 @@ class _LocalAppCore:
         self.media_service = MediaMetadataService(self.cfg.exiftool_path, self.cfg.ffmpeg_path)
         self.thumbs.ffmpeg_bin = self.media_service.ffmpeg_bin
         self.orchestrator.media_service = self.media_service
+        self.orchestrator.antigravity_cli = self.state["antigravity_cli"]
+        self.orchestrator.ai_model = self.state["model"]
         return self.get_settings()
 
     def browse_folder(self, initial_dir: str | None = None) -> dict[str, Any]:
@@ -164,6 +168,9 @@ class _LocalAppCore:
 
         if os.name == "nt":
             try:
+                ps_bin = resolve_cli_binary("powershell")
+                if not ps_bin:
+                    return {"path": "", "cancelled": True, "error": "powershell binary missing"}
                 ps_script = (
                     "Add-Type -AssemblyName System.Windows.Forms; "
                     "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
@@ -172,7 +179,7 @@ class _LocalAppCore:
                     "{ Write-Output $d.SelectedPath }"
                 )
                 proc = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", ps_script],
+                    [ps_bin, "-NoProfile", "-Command", ps_script],
                     capture_output=True,
                     text=True,
                     timeout=120,
@@ -412,6 +419,56 @@ class _LocalAppCore:
             solo_primer_lote=bool(solo_primer_lote),
         )
 
+    def regenerate_ai_names(self, job_id: str) -> dict[str, Any]:
+        """Re-run AI folder naming on all 01_Recuerdos/ event folders for a job."""
+        conn = open_connection(self.cfg.db_path)
+        updated = 0
+        try:
+            rows = conn.execute(
+                """
+                SELECT target_folder, COUNT(*) AS cnt, MIN(source_path) AS sample_path,
+                       AVG(latitude) AS avg_lat, AVG(longitude) AS avg_lon
+                FROM media_items
+                WHERE job_id = ? AND target_folder LIKE '01_Recuerdos/%'
+                GROUP BY target_folder
+                """,
+                (job_id,),
+            ).fetchall()
+            with conn:
+                for row in rows:
+                    old_folder = str(row["target_folder"])
+                    parts = old_folder.split("/")
+                    if len(parts) < 3:
+                        continue
+                    year_part = parts[1]
+                    ym_prefix = parts[2].split(" - ")[0]
+                    orig_parent = Path(str(row["sample_path"])).parent.name
+                    gps_txt = (
+                        f" | GPS: {row['avg_lat']:.2f},{row['avg_lon']:.2f}"
+                        if row["avg_lat"] is not None and row["avg_lon"] is not None
+                        else ""
+                    )
+                    summary = f"{ym_prefix} | {row['cnt']} fotos | carpeta: {orig_parent}{gps_txt}"
+                    ai_name = classify_with_agy(
+                        summary,
+                        cli_command=self.state["antigravity_cli"],
+                        model=self.state["model"],
+                    )
+                    safe_ai = "".join("_" if c in '<>:"/\\|?*' else c for c in ai_name).strip()
+                    if not safe_ai:
+                        continue
+                    new_folder = f"01_Recuerdos/{year_part}/{ym_prefix} - {safe_ai}"
+                    if new_folder != old_folder:
+                        conn.execute(
+                            "UPDATE media_items SET target_folder = ? WHERE job_id = ? AND target_folder = ?",
+                            (new_folder, job_id, old_folder),
+                        )
+                        recompute_filenames(conn, job_id, new_folder)
+                        updated += 1
+        finally:
+            conn.close()
+        return {"job_id": job_id, "updated_folders": updated}
+
     def export_tree(
         self,
         job_id: str,
@@ -483,6 +540,9 @@ if FASTAPI_AVAILABLE:
         confirmed: bool = False
         batch_size: int = Field(default=100, ge=1)
         solo_primer_lote: bool = False
+
+    class AIRegenerateRequest(BaseModel):
+        job_id: str
 
     class ExportRequest(BaseModel):
         job_id: str
@@ -623,6 +683,10 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
             batch_size=payload.batch_size,
             solo_primer_lote=payload.solo_primer_lote,
         )
+
+    @app.post("/api/ai/regenerate")
+    async def ai_regenerate(payload: AIRegenerateRequest) -> dict[str, Any]:
+        return await asyncio.to_thread(core.regenerate_ai_names, payload.job_id)
 
     @app.post("/api/export")
     async def export_tree(payload: ExportRequest) -> dict[str, Any]:
@@ -780,6 +844,8 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                             solo_primer_lote=bool(body.get("solo_primer_lote", False)),
                         ),
                     )
+                elif path == "/api/ai/regenerate":
+                    self._send_json(200, core.regenerate_ai_names(body["job_id"]))
                 elif path == "/api/export":
                     self._send_json(
                         200,

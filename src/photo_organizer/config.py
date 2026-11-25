@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -133,6 +134,39 @@ def is_onedrive_placeholder(
     is_reparse = bool(file_attributes & FILE_ATTRIBUTE_REPARSE_POINT)
     is_cloud = bool(file_attributes & CLOUD_ONLY_MASK)
     return is_reparse and is_cloud
+
+
+def _safe_which(name: str, search_path: str | None = None) -> str | None:
+    """Resolve binary via shutil.which while tolerating 1-arg test monkeypatches."""
+    if search_path is None:
+        return shutil.which(name)
+    try:
+        return shutil.which(name, path=search_path)
+    except TypeError:
+        return shutil.which(name)
+
+
+def resolve_cli_binary(binary: str | None, custom_path: str | None = None) -> str | None:
+    """Resolve optional CLI executable path via custom path or shutil.which without raising."""
+    if custom_path:
+        custom_candidate = Path(str(custom_path).strip())
+        if custom_candidate.is_file():
+            return str(custom_candidate)
+    raw = (binary or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw)
+    if (os.sep in raw or (os.altsep is not None and os.altsep in raw)) and candidate.is_file():
+        return str(candidate)
+
+    found = _safe_which(raw)
+    if found:
+        return found
+    if os.name == "nt" and not raw.lower().endswith(".exe"):
+        found_exe = _safe_which(f"{raw}.exe")
+        if found_exe:
+            return found_exe
+    return None
 
 
 @dataclass

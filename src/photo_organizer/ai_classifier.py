@@ -9,9 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from photo_organizer.config import resolve_cli_binary
 from photo_organizer.db import init_db, open_connection
 
 DEFAULT_AGY_MODEL = "gemini-4-hydrogen-medium"
+_ORIG_SUBPROCESS_RUN = subprocess.run
 
 
 def heuristic_classify(prompt_key: str) -> str:
@@ -53,6 +55,10 @@ def classify_with_agy(
 ) -> str:
     """Invoke local Antigravity CLI (`agy`) via subprocess with heuristic fallback."""
     cmd_bin = (cli_command or "agy").strip() or "agy"
+    resolved_bin = resolve_cli_binary(cmd_bin)
+    if resolved_bin is None and subprocess.run is _ORIG_SUBPROCESS_RUN:
+        return heuristic_classify(prompt_key)
+
     selected_model = (model or DEFAULT_AGY_MODEL).strip() or DEFAULT_AGY_MODEL
     prompt = (
         "Responde únicamente con una etiqueta corta de 1 a 3 palabras en español "
@@ -60,7 +66,7 @@ def classify_with_agy(
     )
     try:
         proc = subprocess.run(
-            [cmd_bin, "-m", selected_model, "-p", prompt],
+            [resolved_bin or cmd_bin, "-m", selected_model, "-p", prompt],
             capture_output=True,
             text=True,
             timeout=timeout,
