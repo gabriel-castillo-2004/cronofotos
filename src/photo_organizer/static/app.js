@@ -892,6 +892,111 @@ function bindEvents() {
     };
   }
 
+  async function loadFaceClusters() {
+    const grid = $("face-clusters-grid");
+    if (!grid) return;
+    try {
+      const data = await api("/api/faces/clusters");
+      const all = Array.isArray(data.clusters) ? data.clusters : [];
+      const top25 = all.filter((c) => !c.ignored).slice(0, 25);
+      grid.innerHTML = "";
+      if (top25.length === 0) {
+        const empty = document.createElement("span");
+        empty.className = "muted";
+        empty.style.fontSize = "0.82rem";
+        empty.textContent = "Sin rostros frecuentes detectados aún.";
+        grid.appendChild(empty);
+        return;
+      }
+      for (const c of top25) {
+        const card = document.createElement("div");
+        card.className = "face-cluster-card";
+
+        const img = document.createElement("img");
+        img.src = c.url || `/api/faces/clusters/${encodeURIComponent(c.cluster_id)}/image`;
+        img.alt = c.label || c.cluster_id;
+        img.className = "face-cluster-thumb";
+
+        const meta = document.createElement("div");
+        meta.className = "face-cluster-meta";
+        meta.textContent = `${c.count || 0} fotos`;
+
+        const input = document.createElement("input");
+        input.type = "text";
+        input.className = "face-cluster-input";
+        input.placeholder = "Ej. Yo (ancla) o Mamá";
+        input.value = c.label || "";
+
+        const actions = document.createElement("div");
+        actions.className = "face-cluster-actions";
+
+        const saveBtn = document.createElement("button");
+        saveBtn.type = "button";
+        saveBtn.className = "btn primary small";
+        saveBtn.textContent = "Guardar";
+        saveBtn.onclick = async () => {
+          try {
+            await api(`/api/faces/clusters/${encodeURIComponent(c.cluster_id)}`, "POST", {
+              label: input.value.trim(),
+            });
+            logActivity(`Rostro guardado en lista blanca: ${input.value.trim() || c.cluster_id}`);
+            await loadFaceClusters();
+          } catch (err) {
+            showToast(`Error al guardar rostro: ${err.message}`, "warn");
+          }
+        };
+
+        const ignoreBtn = document.createElement("button");
+        ignoreBtn.type = "button";
+        ignoreBtn.className = "btn secondary small";
+        ignoreBtn.textContent = "Ignorar";
+        ignoreBtn.onclick = async () => {
+          try {
+            await api(`/api/faces/clusters/${encodeURIComponent(c.cluster_id)}`, "POST", {
+              ignored: true,
+            });
+            logActivity(`Rostro ignorado: ${c.cluster_id}`);
+            await loadFaceClusters();
+          } catch (err) {
+            showToast(`Error al ignorar rostro: ${err.message}`, "warn");
+          }
+        };
+
+        actions.append(saveBtn, ignoreBtn);
+        card.append(img, meta, input, actions);
+        grid.appendChild(card);
+      }
+    } catch (err) {
+      logActivity(`Error cargando rostros frecuentes: ${err.message}`);
+    }
+  }
+
+  if ($("btn-discover-faces")) {
+    $("btn-discover-faces").onclick = async () => {
+      const statusEl = $("faces-discover-status");
+      const btn = $("btn-discover-faces");
+      try {
+        btn.disabled = true;
+        if (statusEl) statusEl.textContent = "Analizando rostros en fotos escaneadas...";
+        await api("/api/faces/discover", "POST", { job_id: state.jobId || null });
+        for (let i = 0; i < 120; i += 1) {
+          await new Promise((r) => setTimeout(r, 350));
+          const st = await api("/api/faces/discover/status");
+          if (statusEl) {
+            statusEl.textContent = `Procesadas ${st.processed || 0}/${st.total || 0} fotos · ${st.clusters_found || 0} grupos`;
+          }
+          if (st.status !== "running") break;
+        }
+        await loadFaceClusters();
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+        showToast(`Error al detectar rostros: ${err.message}`, "warn");
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  }
+
   $("btn-settings").onclick = async () => {
     const cfg = await api("/api/settings");
     $("cfg-exiftool").value = cfg.exiftool_path || "";
@@ -899,6 +1004,7 @@ function bindEvents() {
     $("cfg-antigravity-cli").value = cfg.antigravity_cli || "agy";
     $("cfg-antigravity-model").value = cfg.model || "gemini-4-hydrogen-medium";
     await loadPeople();
+    await loadFaceClusters();
     $("settings-modal").showModal();
   };
 

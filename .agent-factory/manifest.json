@@ -7,5 +7,5 @@
   "plan_summary": "A single-process local FastAPI + SQLite (WAL) + vanilla HTML/CSS/JS web application for non-destructively organizing, deduplicating (SHA-256), enriching (EXIF/XMP/QuickTime + Google Takeout JSON sidecars), and exporting 17,000+ photos and videos into a clean 'Año / AAAA-MM - Evento o Categoría / AAAA-MM-DD_HH-MM-SS_###.ext' tree, hardened with a single-writer DB queue, thread-confined ExifTool pools, deterministic collision numbering, an idempotent two-phase physical exporter, LRU thumbnail caching, and a rate-limited optional Gemini classifier.",
   "repo_url": "https://github.com/gabriel-castillo-2004/cronofotos",
   "deploy_url": "",
-  "updated_at": "2026-11-25T21:12:01.595443+00:00"
+  "updated_at": "2026-11-25T21:44:05.445529+00:00"
 }
