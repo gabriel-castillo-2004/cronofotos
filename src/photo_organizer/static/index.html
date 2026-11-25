@@ -87,6 +87,10 @@
             <input id="incremental-mode" type="checkbox" />
             <span>Modo incremental (exportar solo archivos nuevos)</span>
           </label>
+          <label class="checkbox-label discreet-check">
+            <input id="delta-mode" type="checkbox" />
+            <span>Solo archivos nuevos (Delta contra plan/índice previo)</span>
+          </label>
         </div>
       </div>
 
@@ -122,6 +126,7 @@
           <button id="btn-export-plan" type="button" class="btn secondary">Exportar Plan (.json)</button>
           <button id="btn-import-plan" type="button" class="btn secondary">Importar Plan (.json)</button>
           <input id="import-plan-file" type="file" accept=".json,application/json" class="hidden" />
+          <button id="btn-refine-tree" type="button" class="btn secondary">Refinar árbol ya exportado</button>
           <button id="btn-export" type="button" class="btn primary">Aplicar y Exportar Árbol</button>
           <button id="btn-open-dest" type="button" class="btn secondary hidden">Abrir carpeta destino</button>
         </div>
