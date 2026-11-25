@@ -161,3 +161,41 @@ class ThumbnailCache:
 
         self._put_ram(ram_key, data)
         return data
+
+    def get_or_create_resized(
+        self,
+        opaque_id: str,
+        source_path: Path,
+        sha256: str | None = None,
+        max_dim: int = 256,
+    ) -> Path:
+        """Ensure a cached JPEG thumbnail resized to <= max_dim exists on disk and return its Path."""
+        key = sha256 if sha256 else opaque_id
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in key)
+        out_path = self.cache_dir / f"ai_{max_dim}_{safe}.jpg"
+        if out_path.is_file():
+            return out_path
+
+        if source_path.suffix.lower() in VIDEO_EXTENSIONS:
+            data = self._render_video_thumb(source_path)
+        elif Image is not None:
+            try:
+                with Image.open(source_path) as img:
+                    if ImageOps is not None:
+                        img = ImageOps.exif_transpose(img)
+                    img = img.convert("RGB")
+                    img.thumbnail((max_dim, max_dim))
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=80)
+                    data = buf.getvalue()
+            except Exception:
+                data = self._render_image_thumb(source_path)
+        else:
+            data = self._render_image_thumb(source_path)
+
+        try:
+            out_path.write_bytes(data)
+            self._evict_disk_if_needed()
+        except OSError:
+            pass
+        return out_path

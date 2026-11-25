@@ -201,9 +201,12 @@ def _format_stamp(captured_at: str | None) -> str:
 
 def recompute_filenames(conn: sqlite3.Connection, job_id: str, folder: str) -> int:
     """Deterministically recompute 'AAAA-MM-DD_HH-MM-SS_###.ext' within a folder."""
+    import json as _json
+    from photo_organizer.config import VIDEO_EXTENSIONS
+
     rows = conn.execute(
         """
-        SELECT id, captured_at, sha256, source_path, ext
+        SELECT id, captured_at, sha256, source_path, ext, metadata_json
         FROM media_items
         WHERE job_id = ? AND target_folder = ?
         ORDER BY COALESCE(captured_at, '') ASC, COALESCE(sha256, '') ASC, source_path ASC
@@ -211,19 +214,51 @@ def recompute_filenames(conn: sqlite3.Connection, job_id: str, folder: str) -> i
         (job_id, folder),
     ).fetchall()
 
-    counters: dict[str, int] = {}
-    updates: list[tuple[str, str]] = []
+    by_stamp: dict[str, list[Any]] = {}
     for row in rows:
         stamp = _format_stamp(row["captured_at"])
-        counters[stamp] = counters.get(stamp, 0) + 1
-        new_name = f"{stamp}_{counters[stamp]:03d}{row['ext']}"
-        updates.append((new_name, row["id"]))
+        by_stamp.setdefault(stamp, []).append(row)
+
+    updates: list[tuple[str, str]] = []
+    for stamp, group in by_stamp.items():
+        images = [r for r in group if str(r["ext"]).lower() not in VIDEO_EXTENSIONS]
+        short_videos = []
+        other_videos = []
+        for r in group:
+            if str(r["ext"]).lower() not in VIDEO_EXTENSIONS:
+                continue
+            dur = None
+            if r["metadata_json"]:
+                try:
+                    dur = _json.loads(r["metadata_json"]).get("duration_sec")
+                except Exception:
+                    dur = None
+            if isinstance(dur, (int, float)) and dur <= 3.0:
+                short_videos.append(r)
+            else:
+                other_videos.append(r)
+
+        counter = 0
+        paired: set[str] = set()
+        sv_queue = list(short_videos)
+        for img in images:
+            counter += 1
+            updates.append((f"{stamp}_{counter:03d}{img['ext']}", img["id"]))
+            if sv_queue:
+                vid = sv_queue.pop(0)
+                paired.add(vid["id"])
+                updates.append((f"{stamp}_{counter:03d}{vid['ext']}", vid["id"]))
+        for vid in sv_queue + other_videos:
+            if vid["id"] in paired:
+                continue
+            counter += 1
+            updates.append((f"{stamp}_{counter:03d}{vid['ext']}", vid["id"]))
 
     # Phase 1: move to temporary unique names to avoid transient UNIQUE collisions
     for idx, (_new_name, item_id) in enumerate(updates):
         conn.execute(
             "UPDATE media_items SET target_filename = ? WHERE id = ?",
-            (f"__tmp_{idx}_{item_id}", item_id),
+            (f"tmp-{idx}-{item_id}", item_id),
         )
     # Phase 2: assign final deterministic names
     for new_name, item_id in updates:

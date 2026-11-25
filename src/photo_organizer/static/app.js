@@ -84,7 +84,7 @@ function showToast(message, variant = "ok") {
 }
 
 function setActionBusy(activeBtnId, busyText) {
-  const actionIds = ["btn-start", "btn-ai-regenerate", "btn-export"];
+  const actionIds = ["btn-start", "btn-ai-regenerate", "btn-ai-optimize", "btn-export"];
   const originals = {};
   for (const id of actionIds) {
     const el = $(id);
@@ -254,6 +254,7 @@ async function loadTree() {
     const li = document.createElement("li");
     const isActive = state.selectedFolder === f.folder;
     li.className = `folder-item ${isActive ? "active" : ""}`;
+    li.dataset.folder = f.folder;
     li.setAttribute("role", "treeitem");
     li.setAttribute("aria-selected", isActive ? "true" : "false");
     li.tabIndex = 0;
@@ -268,6 +269,16 @@ async function loadTree() {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
         selectFolder();
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        if (li.nextElementSibling) {
+          li.nextElementSibling.focus();
+        }
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        if (li.previousElementSibling) {
+          li.previousElementSibling.focus();
+        }
       }
     };
     folderList.appendChild(li);
@@ -409,12 +420,18 @@ function bindEvents() {
     const restore = setActionBusy("btn-start", "Organizando...");
     $("progress-stage").textContent = "Estado: Iniciando organización...";
     logActivity(`Iniciando organización (${solo_primer_lote ? "modo prueba" : "completa"})`);
+    const timeGapEl = $("time-gap-hours");
+    const gpsDistEl = $("gps-distance-km");
+    const time_gap_hours = timeGapEl ? Math.max(0.5, Number(timeGapEl.value) || 4) : 4;
+    const gps_distance_km = gpsDistEl ? Math.max(1, Number(gpsDistEl.value) || 25) : 25;
     try {
       const snap = await api("/api/scan/start", "POST", {
         source_dir,
         dest_dir,
         batch_size,
         solo_primer_lote,
+        time_gap_hours,
+        gps_distance_km,
       });
       updateProgressUI(snap);
       connectSSE();
@@ -446,38 +463,98 @@ function bindEvents() {
     }
   };
 
+  const setTreeMutationBusy = (folderName, activeBtnId, busyText) => {
+    const treeBtnIds = ["btn-rename-folder", "btn-merge-folder", "btn-create-folder"];
+    const originals = {};
+    for (const id of treeBtnIds) {
+      const el = $(id);
+      if (!el) continue;
+      originals[id] = el.textContent;
+      el.disabled = true;
+      if (id === activeBtnId && busyText) {
+        el.innerHTML = `<span class="spinner" aria-hidden="true"></span> ${busyText}`;
+      }
+    }
+    const nodeEl =
+      Array.from(document.querySelectorAll(".folder-item")).find(
+        (el) => el.dataset.folder === folderName
+      ) || document.querySelector(".folder-item.active");
+    if (nodeEl) {
+      nodeEl.classList.add("is-loading");
+      nodeEl.setAttribute("aria-busy", "true");
+    }
+    return () => {
+      if (nodeEl) {
+        nodeEl.classList.remove("is-loading");
+        nodeEl.removeAttribute("aria-busy");
+      }
+      for (const id of treeBtnIds) {
+        const el = $(id);
+        if (!el) continue;
+        el.disabled = false;
+        if (originals[id] !== undefined) {
+          el.textContent = originals[id];
+        }
+      }
+    };
+  };
+
   $("btn-rename-folder").onclick = async () => {
     if (!state.jobId || !state.selectedFolder) return;
     const next = prompt("Nuevo nombre de carpeta:", state.selectedFolder);
     if (!next) return;
-    await api("/api/tree/folders/rename", "POST", {
-      job_id: state.jobId,
-      old_folder: state.selectedFolder,
-      new_folder: next,
-    });
-    state.selectedFolder = next;
-    await loadTree();
+    const restore = setTreeMutationBusy(state.selectedFolder, "btn-rename-folder", "Renombrando...");
+    try {
+      await api("/api/tree/folders/rename", "POST", {
+        job_id: state.jobId,
+        old_folder: state.selectedFolder,
+        new_folder: next,
+      });
+      state.selectedFolder = next;
+      await loadTree();
+    } catch (err) {
+      showToast(`Error al renombrar carpeta: ${err.message}`, "warn");
+      logActivity(`Error al renombrar carpeta: ${err.message}`);
+    } finally {
+      restore();
+    }
   };
 
   $("btn-merge-folder").onclick = async () => {
     if (!state.jobId || !state.selectedFolder) return;
     const dest = prompt(`Fusionar '${state.selectedFolder}' dentro de:`, "");
     if (!dest) return;
-    await api("/api/tree/folders/merge", "POST", {
-      job_id: state.jobId,
-      from_folder: state.selectedFolder,
-      to_folder: dest,
-    });
-    state.selectedFolder = dest;
-    await loadTree();
+    const restore = setTreeMutationBusy(state.selectedFolder, "btn-merge-folder", "Fusionando...");
+    try {
+      await api("/api/tree/folders/merge", "POST", {
+        job_id: state.jobId,
+        from_folder: state.selectedFolder,
+        to_folder: dest,
+      });
+      state.selectedFolder = dest;
+      await loadTree();
+    } catch (err) {
+      showToast(`Error al fusionar carpeta: ${err.message}`, "warn");
+      logActivity(`Error al fusionar carpeta: ${err.message}`);
+    } finally {
+      restore();
+    }
   };
 
   $("btn-create-folder").onclick = async () => {
     if (!state.jobId) return;
     const folder = prompt("Nombre de la nueva carpeta:", "01_Recuerdos/2024/2024-01 - Nuevo");
     if (!folder) return;
-    await api("/api/tree/folders/create", "POST", { job_id: state.jobId, folder });
-    await loadTree();
+    const restore = setTreeMutationBusy(state.selectedFolder, "btn-create-folder", "Creando...");
+    try {
+      await api("/api/tree/folders/create", "POST", { job_id: state.jobId, folder });
+      await loadTree();
+    } catch (err) {
+      showToast(`Error al crear carpeta: ${err.message}`, "warn");
+      logActivity(`Error al crear carpeta: ${err.message}`);
+    } finally {
+      restore();
+    }
   };
 
   $("btn-settings").onclick = async () => {
@@ -493,35 +570,163 @@ function bindEvents() {
 
   $("settings-form").onsubmit = async (e) => {
     e.preventDefault();
-    await api("/api/settings", "POST", {
+    const res = await api("/api/settings", "POST", {
       exiftool_path: $("cfg-exiftool").value,
       ffmpeg_path: $("cfg-ffmpeg").value,
       antigravity_cli: $("cfg-antigravity-cli").value,
       model: $("cfg-antigravity-model").value,
     });
     $("settings-modal").close();
+    if (res && res.warning) {
+      showToast(res.warning, "warn");
+      logActivity(res.warning);
+    }
     await refreshHealth();
   };
+
+  if ($("btn-ai-cancel-run")) {
+    $("btn-ai-cancel-run").onclick = async () => {
+      try {
+        await api("/api/ai/cancel", "POST", {});
+        logActivity("Cancelando proceso de IA...");
+      } catch (err) {
+        showToast(`No se pudo cancelar IA: ${err.message}`, "warn");
+      }
+    };
+  }
 
   if ($("btn-ai-regenerate")) {
     $("btn-ai-regenerate").onclick = async () => {
       if (!state.jobId) return showToast("Primero ejecuta Organizar Automáticamente.", "warn");
       const restore = setActionBusy("btn-ai-regenerate", "Regenerando nombres con IA...");
+      if ($("btn-ai-cancel-run")) $("btn-ai-cancel-run").classList.remove("hidden");
       $("progress-stage").textContent = "Estado: Regenerando nombres con IA...";
       logActivity("Regenerando nombres de carpetas con IA...");
       try {
         const res = await api("/api/ai/regenerate", "POST", { job_id: state.jobId });
         const engine = res.engine || res.model || "Fallback local";
-        const msg = `Nombres actualizados (${res.updated_folders || 0} carpetas) usando ${engine}.`;
+        const msg = res.cancelled
+          ? `Regeneración cancelada (${res.updated_folders || 0} carpetas actualizadas).`
+          : `Nombres actualizados (${res.updated_folders || 0} carpetas) usando ${engine}.`;
         $("progress-stage").textContent = `Estado: ${msg}`;
-        showToast(msg, "ok");
+        showToast(msg, res.cancelled ? "warn" : "ok");
         logActivity(msg);
         await loadTree();
       } catch (err) {
         showToast(`Error al regenerar nombres: ${err.message}`, "warn");
         logActivity(`Error al regenerar nombres: ${err.message}`);
       } finally {
+        if ($("btn-ai-cancel-run")) $("btn-ai-cancel-run").classList.add("hidden");
         restore();
+      }
+    };
+  }
+
+  let currentAiSuggestions = [];
+
+  function renderAiSuggestions(suggestions, engine) {
+    const panel = $("ai-optimizer-panel");
+    const list = $("ai-suggestions-list");
+    const engineEl = $("ai-optimizer-engine");
+    if (!panel || !list) return;
+    currentAiSuggestions = Array.isArray(suggestions) ? suggestions : [];
+    if (engineEl) {
+      engineEl.textContent = engine ? `Motor: ${engine}` : "";
+    }
+    list.innerHTML = "";
+    if (currentAiSuggestions.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "muted";
+      empty.textContent = "No se detectaron cambios estructurales necesarios en el árbol actual.";
+      list.appendChild(empty);
+    } else {
+      currentAiSuggestions.forEach((s, idx) => {
+        const row = document.createElement("label");
+        row.className = "ai-suggestion-item";
+        const chk = document.createElement("input");
+        chk.type = "checkbox";
+        chk.checked = true;
+        chk.dataset.idx = String(idx);
+
+        const body = document.createElement("div");
+        body.className = "ai-suggestion-body";
+        const beforeTxt = Array.isArray(s.before) ? s.before.join(" + ") : String(s.before || "");
+        const afterTxt = Array.isArray(s.after) ? s.after.join(" | ") : String(s.after || "");
+        const title = document.createElement("div");
+        title.className = "ai-suggestion-diff";
+        title.textContent = `[${String(s.type || "").toUpperCase()}] ${beforeTxt} -> ${afterTxt}`;
+        const reason = document.createElement("div");
+        reason.className = "ai-suggestion-reason muted";
+        reason.textContent = s.reason || "";
+        body.append(title, reason);
+
+        row.append(chk, body);
+        list.appendChild(row);
+      });
+    }
+    panel.classList.remove("hidden");
+  }
+
+  if ($("btn-ai-close-panel")) {
+    $("btn-ai-close-panel").onclick = () => {
+      if ($("ai-optimizer-panel")) $("ai-optimizer-panel").classList.add("hidden");
+    };
+  }
+
+  if ($("btn-ai-optimize")) {
+    $("btn-ai-optimize").onclick = async () => {
+      if (!state.jobId) return showToast("Primero ejecuta Organizar Automáticamente.", "warn");
+      const restore = setActionBusy("btn-ai-optimize", "Analizando árbol con IA...");
+      $("progress-stage").textContent = "Estado: Analizando árbol con IA...";
+      logActivity("Analizando estructura y miniaturas con IA...");
+      try {
+        const res = await api("/api/tree/ai-suggestions", "POST", { job_id: state.jobId });
+        renderAiSuggestions(res.suggestions || [], res.engine || "Fallback local");
+        const count = (res.suggestions || []).length;
+        const msg = `Análisis completado (${count} sugerencias · ${res.engine || "Fallback local"}).`;
+        $("progress-stage").textContent = `Estado: ${msg}`;
+        showToast(msg, "ok");
+        logActivity(msg);
+      } catch (err) {
+        showToast(`Error al analizar árbol: ${err.message}`, "warn");
+        logActivity(`Error al analizar árbol: ${err.message}`);
+      } finally {
+        restore();
+      }
+    };
+  }
+
+  if ($("btn-ai-apply-suggestions")) {
+    $("btn-ai-apply-suggestions").onclick = async () => {
+      if (!state.jobId) return;
+      const list = $("ai-suggestions-list");
+      const selected = [];
+      if (list) {
+        for (const chk of list.querySelectorAll('input[type="checkbox"]:checked')) {
+          const idx = Number(chk.dataset.idx);
+          if (!Number.isNaN(idx) && currentAiSuggestions[idx]) {
+            selected.push(currentAiSuggestions[idx]);
+          }
+        }
+      }
+      if (selected.length === 0) {
+        return showToast("Selecciona al menos una sugerencia.", "warn");
+      }
+      const btn = $("btn-ai-apply-suggestions");
+      btn.disabled = true;
+      try {
+        const res = await api("/api/tree/apply-suggestions", "POST", {
+          job_id: state.jobId,
+          suggestions: selected,
+        });
+        showToast(`Aplicadas ${res.applied || selected.length} sugerencias al árbol.`, "ok");
+        logActivity(`Sugerencias aplicadas: ${res.applied || selected.length}`);
+        if ($("ai-optimizer-panel")) $("ai-optimizer-panel").classList.add("hidden");
+        await loadTree();
+      } catch (err) {
+        showToast(`Error al aplicar sugerencias: ${err.message}`, "warn");
+      } finally {
+        btn.disabled = false;
       }
     };
   }
@@ -544,22 +749,41 @@ function bindEvents() {
     };
   }
 
-  $("btn-ai-cancel").onclick = () => $("ai-confirm-modal").close();
-  $("btn-ai-confirm").onclick = async () => {
-    const ids = state.items.map((it) => it.id);
-    const { batch_size, solo_primer_lote } = getBatchOptions();
-    const res = await api("/api/ai/classify", "POST", {
-      job_id: state.jobId,
-      item_ids: ids,
-      confirmed: true,
-      batch_size,
-      solo_primer_lote,
-    });
-    $("ai-confirm-modal").close();
-    if (Array.isArray(res.batches)) {
-      renderBatches(res.batches);
+  $("btn-ai-cancel").onclick = async () => {
+    try {
+      await api("/api/ai/cancel", "POST", {});
+    } catch {
+      // ignore if idle
     }
-    await loadTree();
+    $("ai-confirm-modal").close();
+  };
+  $("btn-ai-confirm").onclick = async () => {
+    const btn = $("btn-ai-confirm");
+    const originalHtml = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner" aria-hidden="true"></span> Clasificando...';
+    try {
+      const ids = state.items.map((it) => it.id);
+      const { batch_size, solo_primer_lote } = getBatchOptions();
+      const res = await api("/api/ai/classify", "POST", {
+        job_id: state.jobId,
+        item_ids: ids,
+        confirmed: true,
+        batch_size,
+        solo_primer_lote,
+      });
+      $("ai-confirm-modal").close();
+      if (Array.isArray(res.batches)) {
+        renderBatches(res.batches);
+      }
+      await loadTree();
+    } catch (err) {
+      showToast(`Error al clasificar con IA: ${err.message}`, "warn");
+      logActivity(`Error al clasificar con IA: ${err.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+    }
   };
 
   $("btn-export").onclick = async () => {
@@ -578,7 +802,7 @@ function bindEvents() {
       if (Array.isArray(res.batches)) {
         renderBatches(res.batches);
       }
-      const msg = `Exportación completa: ${res.exported} exportados, ${res.duplicates} duplicados, ${res.skipped} omitidos.`;
+      const msg = `Exportación completa: ${res.exported} exportados, ${res.sidecars_merged || 0} con sidecar .json, ${res.duplicates} duplicados, ${res.skipped} omitidos.`;
       $("progress-stage").textContent = `Estado: ${msg}`;
       showToast(msg, "ok");
       logActivity(msg);

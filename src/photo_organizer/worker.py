@@ -427,7 +427,7 @@ class PipelineOrchestrator:
                                     merged.get("longitude"),
                                     sidecar_res.get("sidecar_path"),
                                     json.dumps(merged),
-                                    f"__skipped_{item_id}{ext}",
+                                    f"omitido_{item_id}{ext}",
                                 ),
                             )
                             processed_total += 1
@@ -451,6 +451,8 @@ class PipelineOrchestrator:
                             longitude=merged.get("longitude"),
                             route_reason=route_override,
                             has_camera_exif=has_camera_exif,
+                            file_size=entry.size_bytes,
+                            duration_sec=embedded.get("duration_sec"),
                         )
                         cluster_inputs.append(cluster_item)
 
@@ -475,7 +477,7 @@ class PipelineOrchestrator:
                                 merged.get("longitude"),
                                 sidecar_res.get("sidecar_path"),
                                 json.dumps(merged),
-                                f"__staging_{item_id}{ext}",
+                                f"pendiente_{item_id}{ext}",
                             ),
                         )
                         processed_total += 1
@@ -509,7 +511,8 @@ class PipelineOrchestrator:
             folder_items: dict[str, list[ClusterItem]] = {}
             for ci in cluster_inputs:
                 tf = staged[ci.id]["target_folder"]
-                if tf.startswith("01_Recuerdos/"):
+                rr = staged[ci.id].get("route_reason")
+                if tf.startswith("01_Recuerdos/") and rr not in ("multiday_trip", "momentos_varios"):
                     folder_items.setdefault(tf, []).append(ci)
 
             folder_renames: dict[str, str] = {}
@@ -519,9 +522,9 @@ class PipelineOrchestrator:
                     continue
                 year_part = parts[1]
                 ym_prefix = parts[2].split(" - ")[0]
-                sample = group_items[0]
-                orig_parent = Path(sample.source_path).parent.name
-                loc_label = offline_reverse_geocode(sample.latitude, sample.longitude)
+                first_item = group_items[0]
+                orig_parent = Path(first_item.source_path).parent.name
+                loc_label = offline_reverse_geocode(first_item.latitude, first_item.longitude)
                 gps_txt = (
                     f" | GPS: {loc_label}"
                     if loc_label and not loc_label.startswith("GPS ")

@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from photo_organizer.config import resolve_cli_binary
+from photo_organizer.config import AGY_ALLOWED_NAMES, is_standard_agy_binary, resolve_cli_binary
 from photo_organizer.db import init_db, open_connection
 
+logger = logging.getLogger(__name__)
 DEFAULT_AGY_MODEL = "gemini-4-hydrogen-medium"
 _ORIG_SUBPROCESS_RUN = subprocess.run
 
@@ -46,6 +49,8 @@ def _clean_label(raw: str) -> str:
     """Sanitize an event label and strip template/punctuation artifacts."""
     cleaned = raw.strip().strip("\"'`")
     cleaned = re.sub(r"Fotos_Carpeta__Gps_[^\s]*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:fallback_|placeholder|sample_)[^\s]*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"__+", " ", cleaned)
     cleaned = re.sub(r"[<>:\"/\\|?*]+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned[:60]
@@ -57,9 +62,12 @@ def _parse_agy_output(stdout: str) -> str:
     if not text:
         return ""
 
-    # Strip optional markdown code fences
+    # Strip optional markdown code fences (including unclosed leading fences)
     fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
-    candidate = fence_match.group(1).strip() if fence_match else text
+    if fence_match:
+        candidate = fence_match.group(1).strip()
+    else:
+        candidate = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
 
     # Try direct JSON or embedded JSON object
     json_candidates = [candidate]
@@ -75,10 +83,20 @@ def _parse_agy_output(stdout: str) -> str:
                     val = parsed.get(key)
                     if isinstance(val, str) and val.strip():
                         return _clean_label(val)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Salida JSON malformada o truncada de agy: %s", exc)
             continue
 
+    # If the output looks like truncated/malformed JSON, let the caller fall back cleanly
+    if candidate.startswith(("{", "[")) or re.search(
+        r'"(?:nombre_evento|event_name|nombre|evento|label)"\s*:',
+        candidate,
+    ):
+        return ""
+
     first_line = next((ln.strip() for ln in candidate.splitlines() if ln.strip()), "")
+    if first_line.startswith(("{", "[")):
+        return ""
     return _clean_label(first_line)
 
 
@@ -144,11 +162,17 @@ def classify_with_agy(
     cli_command: str = "agy",
     model: str = DEFAULT_AGY_MODEL,
     timeout: float = 15.0,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Invoke local Antigravity CLI (`agy`) via subprocess with heuristic fallback."""
+    if cancel_event is not None and cancel_event.is_set():
+        return heuristic_classify(prompt_key)
+
     cmd_bin = (cli_command or "agy").strip() or "agy"
-    resolved_bin = resolve_cli_binary(cmd_bin)
-    if resolved_bin is None and subprocess.run is _ORIG_SUBPROCESS_RUN:
+    resolved_bin = resolve_cli_binary(cmd_bin, allowed_names=AGY_ALLOWED_NAMES)
+    if resolved_bin is None and (
+        subprocess.run is _ORIG_SUBPROCESS_RUN or not is_standard_agy_binary(cmd_bin)
+    ):
         return heuristic_classify(prompt_key)
 
     selected_model = (model or DEFAULT_AGY_MODEL).strip() or DEFAULT_AGY_MODEL
@@ -158,20 +182,44 @@ def classify_with_agy(
         "(máximo 3 palabras, sin explicación adicional) para este grupo de fotos: "
         f"{prompt_key}"
     )
+    argv = [resolved_bin or cmd_bin, "-m", selected_model, "-p", prompt]
     try:
-        proc = subprocess.run(
-            [resolved_bin or cmd_bin, "-m", selected_model, "-p", prompt],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        if proc.returncode == 0 and proc.stdout:
-            parsed = _parse_agy_output(proc.stdout)
-            if parsed:
-                return parsed
-    except (OSError, subprocess.SubprocessError):
-        pass
+        if subprocess.run is not _ORIG_SUBPROCESS_RUN:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                parsed = _parse_agy_output(proc.stdout)
+                if parsed:
+                    return parsed
+        else:
+            proc_p = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + timeout
+            while proc_p.poll() is None:
+                if (cancel_event is not None and cancel_event.is_set()) or time.monotonic() >= deadline:
+                    proc_p.terminate()
+                    try:
+                        proc_p.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        proc_p.kill()
+                    return heuristic_classify(prompt_key)
+                time.sleep(0.05)
+            stdout_data, _ = proc_p.communicate()
+            if proc_p.returncode == 0 and stdout_data:
+                parsed = _parse_agy_output(stdout_data)
+                if parsed:
+                    return parsed
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        logger.warning("Error ejecutando o parseando salida de agy: %s", exc)
     return heuristic_classify(prompt_key)
 
 
@@ -301,6 +349,7 @@ class GeminiClassifier:
         kind: str = "item",
         batch_size: int = 100,
         solo_primer_lote: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Require explicit user confirmation before dispatching a remote AI batch."""
         eff_batch_size = batch_size if batch_size and batch_size > 0 else 100
@@ -335,7 +384,11 @@ class GeminiClassifier:
         ]
 
         results: dict[str, str] = {}
+        cancelled = False
         for b_idx, chunk in enumerate(chunks):
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
             batch_info = batches[b_idx]
             cached_chunk: dict[str, str] = {}
             for k in chunk:
@@ -354,6 +407,9 @@ class GeminiClassifier:
             t0 = time.monotonic()
             errors = 0
             for k in chunk:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
                 try:
                     results[k] = self.classify(k, kind=kind)
                     batch_info["processed_items"] += 1
@@ -365,7 +421,7 @@ class GeminiClassifier:
             batch_info["elapsed_seconds"] = round(time.monotonic() - t0, 3)
             batch_info["status"] = "error" if errors > 0 and batch_info["processed_items"] == 0 else "completado"
 
-            if solo_primer_lote and b_idx == 0 and total_batches > 1:
+            if cancelled or (solo_primer_lote and b_idx == 0 and total_batches > 1):
                 break
 
         return {
@@ -375,6 +431,243 @@ class GeminiClassifier:
             "solo_primer_lote": solo_primer_lote,
             "model": self.model,
             "circuit_open": self.circuit_open,
+            "cancelled": cancelled,
             "batches": batches,
             "results": results,
         }
+
+
+_FORBIDDEN_TEMPLATE_TOKENS = ("__", "placeholder", "sample")
+
+
+def _is_clean_suggestion_text(val: Any) -> bool:
+    if not isinstance(val, str) or not val.strip():
+        return False
+    low = val.lower()
+    return not any(tok in low for tok in _FORBIDDEN_TEMPLATE_TOKENS)
+
+
+def _sanitize_suggestion(raw: dict[str, Any], folder_meta: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    stype = str(raw.get("type", "")).strip().lower()
+    if stype not in {"rename", "merge", "split"}:
+        return None
+    reason = str(raw.get("reason", "")).strip() or "Optimización estructural sugerida"
+    if not _is_clean_suggestion_text(reason):
+        return None
+
+    if stype == "rename":
+        before = raw.get("before")
+        after = raw.get("after")
+        if not (_is_clean_suggestion_text(before) and _is_clean_suggestion_text(after)):
+            return None
+        if before == after:
+            return None
+        return {"type": "rename", "before": str(before).strip(), "after": str(after).strip(), "reason": reason}
+
+    if stype == "merge":
+        before = raw.get("before")
+        after = raw.get("after")
+        if not isinstance(before, list) or len(before) < 2:
+            return None
+        if not all(_is_clean_suggestion_text(b) for b in before) or not _is_clean_suggestion_text(after):
+            return None
+        return {
+            "type": "merge",
+            "before": [str(b).strip() for b in before],
+            "after": str(after).strip(),
+            "reason": reason,
+        }
+
+    # stype == "split"
+    before = raw.get("before")
+    after = raw.get("after")
+    if not _is_clean_suggestion_text(before) or not isinstance(after, list) or len(after) < 2:
+        return None
+    if not all(_is_clean_suggestion_text(a) for a in after):
+        return None
+    meta = folder_meta.get(str(before).strip())
+    if meta is not None:
+        if int(meta.get("count", 0)) <= 25 or float(meta.get("max_gap_hours", 0.0)) < 3.0:
+            return None
+    return {
+        "type": "split",
+        "before": str(before).strip(),
+        "after": [str(a).strip() for a in after],
+        "reason": reason,
+    }
+
+
+def _parse_suggestions_json(stdout: str, folder_meta: dict[str, dict[str, Any]]) -> list[dict[str, Any]] | None:
+    text = (stdout or "").strip()
+    if not text:
+        return None
+    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    candidate = fence_match.group(1).strip() if fence_match else text
+    candidates = [candidate]
+    obj_match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+    if obj_match:
+        candidates.append(obj_match.group(0))
+
+    for jc in candidates:
+        try:
+            parsed = json.loads(jc)
+            if isinstance(parsed, dict) and isinstance(parsed.get("suggestions"), list):
+                cleaned: list[dict[str, Any]] = []
+                for item in parsed["suggestions"]:
+                    if isinstance(item, dict):
+                        s = _sanitize_suggestion(item, folder_meta)
+                        if s is not None:
+                            cleaned.append(s)
+                return cleaned
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
+
+
+def _deterministic_tree_suggestions(folder_summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    suggestions: list[dict[str, Any]] = []
+    ordered = sorted(folder_summaries, key=lambda f: str(f.get("folder", "")))
+
+    for f in ordered:
+        folder = str(f.get("folder", ""))
+        cnt = int(f.get("count", 0))
+        gap = float(f.get("max_gap_hours", 0.0))
+        loc = str(f.get("location_label") or "").strip()
+
+        if cnt > 25 and gap >= 3.0:
+            base = folder.split(" - ")[0] if " - " in folder else folder
+            suggestions.append(
+                {
+                    "type": "split",
+                    "before": folder,
+                    "after": [f"{base} - Sesión Mañana", f"{base} - Sesión Tarde"],
+                    "reason": "Carpeta con más de 25 archivos y salto temporal interno >= 3 horas",
+                }
+            )
+        elif folder.endswith(" - Eventos del día") and loc and not loc.startswith("GPS "):
+            prefix = folder.rsplit(" - ", 1)[0]
+            city = loc.split(",")[0].strip()
+            if city and _is_clean_suggestion_text(city):
+                suggestions.append(
+                    {
+                        "type": "rename",
+                        "before": folder,
+                        "after": f"{prefix} - {city}",
+                        "reason": f"Ubicación GPS detectada en {city}",
+                    }
+                )
+
+    for i in range(len(ordered) - 1):
+        f1 = ordered[i]
+        f2 = ordered[i + 1]
+        if int(f1.get("count", 0)) < 4 and int(f2.get("count", 0)) < 4:
+            d1 = str(f1.get("end_date") or "")[:10]
+            d2 = str(f2.get("start_date") or "")[:10]
+            if d1 and d2 and f1.get("location_label") == f2.get("location_label"):
+                try:
+                    dt1 = datetime.fromisoformat(d1)
+                    dt2 = datetime.fromisoformat(d2)
+                    if 0 <= (dt2 - dt1).days <= 1:
+                        p1 = str(f1["folder"]).split("/")
+                        if len(p1) >= 3:
+                            year = p1[1]
+                            s_ymd = str(f1.get("start_date") or d1)[:10]
+                            e_md = d2[5:10]
+                            suggestions.append(
+                                {
+                                    "type": "merge",
+                                    "before": [str(f1["folder"]), str(f2["folder"])],
+                                    "after": f"01_Recuerdos/{year}/{s_ymd} al {e_md} - Eventos Cercanos",
+                                    "reason": "Carpetas consecutivas pequeñas en la misma zona",
+                                }
+                            )
+                except ValueError:
+                    pass
+
+    return suggestions
+
+
+def suggest_tree_optimizations(
+    folder_summaries: list[dict[str, Any]],
+    *,
+    cli_command: str = "agy",
+    model: str = DEFAULT_AGY_MODEL,
+    timeout: float = 20.0,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Analyze folder metadata + <=256px representative thumbnails in batches of <=12 via agy."""
+    if not folder_summaries:
+        return {"engine": "Fallback determinista local", "suggestions": []}
+
+    folder_meta = {str(f["folder"]): f for f in folder_summaries if f.get("folder")}
+    cmd_bin = (cli_command or "agy").strip() or "agy"
+    resolved_bin = resolve_cli_binary(cmd_bin, allowed_names=AGY_ALLOWED_NAMES)
+    selected_model = (model or DEFAULT_AGY_MODEL).strip() or DEFAULT_AGY_MODEL
+
+    can_call_agy = resolved_bin is not None or (
+        subprocess.run is not _ORIG_SUBPROCESS_RUN and is_standard_agy_binary(cmd_bin)
+    )
+    if not can_call_agy or (cancel_event is not None and cancel_event.is_set()):
+        return {
+            "engine": "Fallback determinista local",
+            "suggestions": _deterministic_tree_suggestions(folder_summaries),
+        }
+
+    batch_size = 12
+    all_suggestions: list[dict[str, Any]] = []
+    agy_failed = False
+
+    for i in range(0, len(folder_summaries), batch_size):
+        if cancel_event is not None and cancel_event.is_set():
+            agy_failed = True
+            break
+        chunk = folder_summaries[i : i + batch_size]
+        compact = [
+            {
+                "folder": f.get("folder"),
+                "count": f.get("count"),
+                "start_date": f.get("start_date"),
+                "end_date": f.get("end_date"),
+                "location": f.get("location_label"),
+                "max_gap_hours": f.get("max_gap_hours"),
+                "thumbnail": f.get("thumb_path"),
+            }
+            for f in chunk
+        ]
+        prompt = (
+            "Analiza estas carpetas (máximo 12 por lote) y responde ÚNICAMENTE con JSON válido "
+            '{"suggestions": [{"type": "rename|merge|split", "before": ..., "after": ..., "reason": "..."}]}. '
+            "Reglas: split solo si count > 25 y max_gap_hours >= 3.0. "
+            "Carpetas: " + json.dumps(compact, ensure_ascii=False)
+        )
+        argv = [resolved_bin or cmd_bin, "-m", selected_model, "-p", prompt]
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if proc.returncode != 0 or not proc.stdout:
+                agy_failed = True
+                break
+            parsed = _parse_suggestions_json(proc.stdout, folder_meta)
+            if parsed is None:
+                agy_failed = True
+                break
+            all_suggestions.extend(parsed)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            logger.warning("Fallo al consultar agy para optimización de árbol: %s", exc)
+            agy_failed = True
+            break
+
+    if agy_failed:
+        return {
+            "engine": "Fallback determinista local",
+            "suggestions": _deterministic_tree_suggestions(folder_summaries),
+        }
+    return {
+        "engine": f"agy · {selected_model}",
+        "suggestions": all_suggestions,
+    }

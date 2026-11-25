@@ -20,9 +20,22 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from photo_organizer.ai_classifier import DEFAULT_AGY_MODEL, GeminiClassifier, classify_with_agy
+from datetime import datetime
+from photo_organizer.ai_classifier import (
+    DEFAULT_AGY_MODEL,
+    GeminiClassifier,
+    classify_with_agy,
+    suggest_tree_optimizations,
+)
 from photo_organizer.clustering import offline_reverse_geocode
-from photo_organizer.config import OrganizerConfig, resolve_cli_binary, validate_source_dest_pair
+from photo_organizer.config import (
+    AGY_ALLOWED_NAMES,
+    VIDEO_EXTENSIONS,
+    OrganizerConfig,
+    is_standard_agy_binary,
+    resolve_cli_binary,
+    validate_source_dest_pair,
+)
 from photo_organizer.db import init_db, open_connection, recompute_filenames
 from photo_organizer.exporter import run_two_phase_export
 from photo_organizer.media import BinaryHealthCheck, MediaMetadataService
@@ -90,6 +103,7 @@ class _LocalAppCore:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._loop_lock = threading.Lock()
+        self._ai_cancel_event = threading.Event()
 
     def _ensure_bg_loop(self) -> asyncio.AbstractEventLoop:
         with self._loop_lock:
@@ -112,7 +126,7 @@ class _LocalAppCore:
     def health(self) -> dict[str, Any]:
         status = BinaryHealthCheck.check(self.cfg.exiftool_path, self.cfg.ffmpeg_path)
         agy_cmd = self.state.get("antigravity_cli") or "agy"
-        agy_path = resolve_cli_binary(agy_cmd)
+        agy_path = resolve_cli_binary(agy_cmd, allowed_names=AGY_ALLOWED_NAMES)
         agy_ok = bool(agy_path)
         model = self.state.get("model") or DEFAULT_AGY_MODEL
         return {
@@ -145,8 +159,15 @@ class _LocalAppCore:
         if payload.get("ffmpeg_path") is not None:
             self.cfg.ffmpeg_path = str(payload["ffmpeg_path"]).strip() or None
         cli_cmd = payload.get("antigravity_cli")
+        cli_warning: str | None = None
         if cli_cmd is not None:
-            self.state["antigravity_cli"] = str(cli_cmd).strip() or "agy"
+            cleaned_cli = str(cli_cmd).strip() or "agy"
+            if not is_standard_agy_binary(cleaned_cli):
+                cli_warning = (
+                    "El comando Antigravity CLI difiere del ejecutable estándar 'agy' "
+                    "(agy.exe/.cmd/.bat) y no se ejecutará."
+                )
+            self.state["antigravity_cli"] = cleaned_cli
         model = str(payload.get("model") or payload.get("gemini_model") or "").strip()
         if model:
             self.state["model"] = model
@@ -157,7 +178,10 @@ class _LocalAppCore:
         self.orchestrator.media_service = self.media_service
         self.orchestrator.antigravity_cli = self.state["antigravity_cli"]
         self.orchestrator.ai_model = self.state["model"]
-        return self.get_settings()
+        settings = self.get_settings()
+        if cli_warning:
+            settings["warning"] = cli_warning
+        return settings
 
     def browse_folder(self, initial_dir: str | None = None) -> dict[str, Any]:
         """Open a native folder picker dialog on the local Windows/desktop host."""
@@ -412,6 +436,11 @@ class _LocalAppCore:
             raise _ApiError(404, "Item not found")
         return self.thumbs.get_or_create(row["id"], Path(row["source_path"]), row["sha256"])
 
+    def cancel_ai(self) -> dict[str, Any]:
+        """Signal any in-flight AI classification or folder regeneration to stop."""
+        self._ai_cancel_event.set()
+        return {"cancelled": True}
+
     def ai_classify(
         self,
         item_ids: list[str],
@@ -419,6 +448,8 @@ class _LocalAppCore:
         batch_size: int = 100,
         solo_primer_lote: bool = False,
     ) -> dict[str, Any]:
+        if confirmed:
+            self._ai_cancel_event.clear()
         clf = GeminiClassifier(
             self.cfg.db_path,
             cli_command=self.state["antigravity_cli"],
@@ -429,22 +460,25 @@ class _LocalAppCore:
             confirmed=confirmed,
             batch_size=int(batch_size or 100),
             solo_primer_lote=bool(solo_primer_lote),
+            cancel_event=self._ai_cancel_event,
         )
 
     def regenerate_ai_names(self, job_id: str) -> dict[str, Any]:
         """Invalidate AI name cache and re-run AI folder naming on 01_Recuerdos/ folders."""
+        self._ai_cancel_event.clear()
         conn = open_connection(self.cfg.db_path)
         updated = 0
         total_folders = 0
+        cancelled = False
         cli_cmd = self.state["antigravity_cli"]
         model = self.state["model"]
-        agy_available = bool(resolve_cli_binary(cli_cmd))
+        agy_available = bool(resolve_cli_binary(cli_cmd, allowed_names=AGY_ALLOWED_NAMES))
         try:
             with conn:
                 conn.execute("DELETE FROM ai_cache")
             rows = conn.execute(
                 """
-                SELECT target_folder, COUNT(*) AS cnt, MIN(source_path) AS sample_path,
+                SELECT target_folder, COUNT(*) AS cnt, MIN(source_path) AS first_source_path,
                        AVG(latitude) AS avg_lat, AVG(longitude) AS avg_lon
                 FROM media_items
                 WHERE job_id = ? AND target_folder LIKE '01_Recuerdos/%'
@@ -455,13 +489,16 @@ class _LocalAppCore:
             total_folders = len(rows)
             with conn:
                 for row in rows:
+                    if self._ai_cancel_event.is_set():
+                        cancelled = True
+                        break
                     old_folder = str(row["target_folder"])
                     parts = old_folder.split("/")
                     if len(parts) < 3:
                         continue
                     year_part = parts[1]
                     ym_prefix = parts[2].split(" - ")[0]
-                    orig_parent = Path(str(row["sample_path"])).parent.name
+                    orig_parent = Path(str(row["first_source_path"])).parent.name
                     loc_label = offline_reverse_geocode(row["avg_lat"], row["avg_lon"])
                     gps_txt = (
                         f" | GPS: {loc_label}"
@@ -473,7 +510,11 @@ class _LocalAppCore:
                         summary,
                         cli_command=cli_cmd,
                         model=model,
+                        cancel_event=self._ai_cancel_event,
                     )
+                    if self._ai_cancel_event.is_set():
+                        cancelled = True
+                        break
                     safe_ai = "".join("_" if c in '<>:"/\\|?*' else c for c in ai_name).strip()
                     if not safe_ai:
                         continue
@@ -493,10 +534,202 @@ class _LocalAppCore:
             "updated_folders": updated,
             "total_folders": total_folders,
             "cache_cleared": True,
+            "cancelled": cancelled,
             "engine": engine_name,
-            "ai_engine": "agy" if agy_available else "fallback_local",
+            "ai_engine": "agy" if agy_available else "heuristica_local",
             "model": model,
         }
+
+    def get_ai_tree_suggestions(self, job_id: str | None = None) -> dict[str, Any]:
+        """Build folder summaries + <=256px representative thumbnails and request AI suggestions."""
+        self._ai_cancel_event.clear()
+        conn = open_connection(self.cfg.db_path)
+        try:
+            jid = job_id
+            if not jid:
+                row = conn.execute("SELECT id FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+                if not row:
+                    raise _ApiError(404, "No hay trabajos activos para analizar")
+                jid = str(row["id"])
+
+            rows = conn.execute(
+                """
+                SELECT id, source_path, ext, sha256, captured_at, location_label, target_folder
+                FROM media_items
+                WHERE job_id = ? AND target_folder LIKE '01_Recuerdos/%'
+                ORDER BY target_folder ASC, COALESCE(captured_at, '') ASC, COALESCE(sha256, '') ASC, source_path ASC
+                """,
+                (jid,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        by_folder: dict[str, list[Any]] = {}
+        for r in rows:
+            by_folder.setdefault(str(r["target_folder"]), []).append(r)
+
+        folder_summaries: list[dict[str, Any]] = []
+        for folder, items in by_folder.items():
+            mid = len(items) // 2
+            rep = items[mid]
+            for offset in range(len(items)):
+                cand_idx = mid + (offset if offset % 2 == 0 else -offset) // 2
+                if 0 <= cand_idx < len(items) and str(items[cand_idx]["ext"]).lower() not in VIDEO_EXTENSIONS:
+                    rep = items[cand_idx]
+                    break
+            thumb_path = self.thumbs.get_or_create_resized(
+                str(rep["id"]),
+                Path(str(rep["source_path"])),
+                sha256=rep["sha256"],
+                max_dim=256,
+            )
+
+            parsed_dts: list[datetime] = []
+            loc_label: str | None = None
+            for it in items:
+                if not loc_label and it["location_label"]:
+                    loc_label = str(it["location_label"])
+                ts = it["captured_at"]
+                if ts:
+                    try:
+                        parsed_dts.append(datetime.fromisoformat(str(ts).replace("Z", "+00:00")))
+                    except ValueError:
+                        pass
+            parsed_dts.sort()
+            max_gap = 0.0
+            for idx in range(1, len(parsed_dts)):
+                gap = (parsed_dts[idx] - parsed_dts[idx - 1]).total_seconds() / 3600.0
+                if gap > max_gap:
+                    max_gap = gap
+
+            folder_summaries.append(
+                {
+                    "folder": folder,
+                    "count": len(items),
+                    "start_date": parsed_dts[0].isoformat() if parsed_dts else None,
+                    "end_date": parsed_dts[-1].isoformat() if parsed_dts else None,
+                    "location_label": loc_label,
+                    "max_gap_hours": round(max_gap, 2),
+                    "thumb_path": str(thumb_path),
+                }
+            )
+
+        res = suggest_tree_optimizations(
+            folder_summaries,
+            cli_command=self.state["antigravity_cli"],
+            model=self.state["model"],
+            cancel_event=self._ai_cancel_event,
+        )
+        return {
+            "job_id": jid,
+            "engine": res["engine"],
+            "suggestions": res["suggestions"],
+        }
+
+    def apply_ai_tree_suggestions(
+        self,
+        job_id: str,
+        suggestions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Apply selected rename, merge, and split suggestions cleanly to SQLite staging."""
+        conn = open_connection(self.cfg.db_path)
+        applied = 0
+        touched_folders: set[str] = set()
+        try:
+            with conn:
+                for s in suggestions:
+                    if not isinstance(s, dict):
+                        continue
+                    stype = str(s.get("type", "")).strip().lower()
+                    if stype == "rename":
+                        before = str(s.get("before", "")).strip()
+                        after = str(s.get("after", "")).strip()
+                        if before and after and before != after:
+                            cur = conn.execute(
+                                "UPDATE media_items SET target_folder = ? WHERE job_id = ? AND target_folder = ?",
+                                (after, job_id, before),
+                            )
+                            if cur.rowcount > 0:
+                                touched_folders.add(after)
+                                applied += 1
+                    elif stype == "merge":
+                        before_list = s.get("before")
+                        after = str(s.get("after", "")).strip()
+                        if isinstance(before_list, list) and after:
+                            merged_any = False
+                            for bf in before_list:
+                                b_str = str(bf).strip()
+                                if b_str and b_str != after:
+                                    cur = conn.execute(
+                                        "UPDATE media_items SET target_folder = ? WHERE job_id = ? AND target_folder = ?",
+                                        (after, job_id, b_str),
+                                    )
+                                    if cur.rowcount > 0:
+                                        merged_any = True
+                            if merged_any:
+                                touched_folders.add(after)
+                                applied += 1
+                    elif stype == "split":
+                        before = str(s.get("before", "")).strip()
+                        after_list = s.get("after")
+                        if not before or not isinstance(after_list, list) or len(after_list) < 2:
+                            continue
+                        targets = [str(a).strip() for a in after_list if str(a).strip()]
+                        if len(targets) < 2:
+                            continue
+                        rows = conn.execute(
+                            """
+                            SELECT id, captured_at
+                            FROM media_items
+                            WHERE job_id = ? AND target_folder = ?
+                            ORDER BY COALESCE(captured_at, '') ASC, COALESCE(sha256, '') ASC, source_path ASC
+                            """,
+                            (job_id, before),
+                        ).fetchall()
+                        if not rows:
+                            continue
+                        # Find largest internal time gaps to split into len(targets) groups
+                        gaps: list[tuple[float, int]] = []
+                        dts: list[datetime | None] = []
+                        for r in rows:
+                            ts = r["captured_at"]
+                            dt_val = None
+                            if ts:
+                                try:
+                                    dt_val = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                                except ValueError:
+                                    dt_val = None
+                            dts.append(dt_val)
+                        for idx in range(1, len(rows)):
+                            d_prev, d_curr = dts[idx - 1], dts[idx]
+                            g = (d_curr - d_prev).total_seconds() if (d_prev and d_curr) else 0.0
+                            gaps.append((g, idx))
+                        num_splits = len(targets) - 1
+                        if any(g > 0 for g, _ in gaps):
+                            split_indices = sorted(
+                                idx for _, idx in sorted(gaps, key=lambda x: (-x[0], x[1]))[:num_splits]
+                            )
+                        else:
+                            step = max(1, len(rows) // len(targets))
+                            split_indices = [step * k for k in range(1, len(targets))]
+                        bounds = [0, *split_indices, len(rows)]
+                        for grp_idx in range(len(targets)):
+                            target_f = targets[grp_idx]
+                            chunk_rows = rows[bounds[grp_idx] : bounds[grp_idx + 1]]
+                            for r in chunk_rows:
+                                conn.execute(
+                                    "UPDATE media_items SET target_folder = ? WHERE id = ?",
+                                    (target_f, r["id"]),
+                                )
+                            if chunk_rows:
+                                touched_folders.add(target_f)
+                        applied += 1
+
+                for tf in touched_folders:
+                    recompute_filenames(conn, job_id, tf)
+        finally:
+            conn.close()
+        return {"status": "ok", "job_id": job_id, "applied": applied}
 
     def open_destination(self, job_id: str | None = None, path: str | None = None) -> dict[str, Any]:
         """Open the destination library directory in the local OS file explorer."""
@@ -596,6 +829,13 @@ if FASTAPI_AVAILABLE:
 
     class AIRegenerateRequest(BaseModel):
         job_id: str
+
+    class AITreeSuggestionsRequest(BaseModel):
+        job_id: str | None = None
+
+    class AITreeApplyRequest(BaseModel):
+        job_id: str
+        suggestions: list[dict[str, Any]] = Field(default_factory=list)
 
     class ExportRequest(BaseModel):
         job_id: str
@@ -745,6 +985,18 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
     async def ai_regenerate(payload: AIRegenerateRequest) -> dict[str, Any]:
         return await asyncio.to_thread(core.regenerate_ai_names, payload.job_id)
 
+    @app.post("/api/tree/ai-suggestions")
+    async def ai_tree_suggestions(payload: AITreeSuggestionsRequest) -> dict[str, Any]:
+        return await asyncio.to_thread(core.get_ai_tree_suggestions, payload.job_id)
+
+    @app.post("/api/tree/apply-suggestions")
+    async def ai_tree_apply(payload: AITreeApplyRequest) -> dict[str, Any]:
+        return await asyncio.to_thread(core.apply_ai_tree_suggestions, payload.job_id, payload.suggestions)
+
+    @app.post("/api/ai/cancel")
+    async def ai_cancel() -> dict[str, Any]:
+        return core.cancel_ai()
+
     @app.post("/api/export")
     async def export_tree(payload: ExportRequest) -> dict[str, Any]:
         try:
@@ -783,6 +1035,11 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
             self.send_response(code)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; img-src 'self' data: blob:;",
+            )
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(data)
 
@@ -841,6 +1098,11 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
+                    self.send_header(
+                        "Content-Security-Policy",
+                        "default-src 'self'; img-src 'self' data: blob:;",
+                    )
+                    self.send_header("X-Content-Type-Options", "nosniff")
                     self.end_headers()
                     while True:
                         try:
@@ -910,6 +1172,18 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                     )
                 elif path == "/api/ai/regenerate":
                     self._send_json(200, core.regenerate_ai_names(body["job_id"]))
+                elif path == "/api/tree/ai-suggestions":
+                    self._send_json(200, core.get_ai_tree_suggestions(body.get("job_id")))
+                elif path == "/api/tree/apply-suggestions":
+                    self._send_json(
+                        200,
+                        core.apply_ai_tree_suggestions(
+                            body["job_id"],
+                            body.get("suggestions", []),
+                        ),
+                    )
+                elif path == "/api/ai/cancel":
+                    self._send_json(200, core.cancel_ai())
                 elif path == "/api/export":
                     self._send_json(
                         200,
