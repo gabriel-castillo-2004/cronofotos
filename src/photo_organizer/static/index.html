@@ -125,7 +125,7 @@
             <span id="ai-debate-progress" class="badge muted-badge hidden"></span>
             <button id="btn-ai-cancel-run" type="button" class="btn small hidden">Cancelar IA</button>
             <button id="btn-open-dest" type="button" class="btn secondary small hidden">Abrir carpeta destino</button>
-            <button id="btn-export" type="button" class="btn primary small">Aplicar y Exportar Árbol</button>
+            <button id="btn-export" type="button" class="btn small" disabled>Aplicar y Exportar Árbol</button>
           </div>
         </div>
       </div>
@@ -157,7 +157,7 @@
           </div>
           <div class="progress-status-inline">
             <span id="progress-phase" class="phase-pill">1/4 Depurando duplicados</span>
-            <span id="progress-stage" class="muted">En espera</span>
+            <span id="progress-stage" class="muted">Estado: En espera</span>
           </div>
         </div>
         <progress id="progress-bar" max="100" value="0" aria-label="Progreso de organización"></progress>
@@ -206,6 +206,7 @@
           <div class="empty-state">
             <h3>Aún no hay elementos escaneados</h3>
             <p>Selecciona tu <strong>Carpeta con fotos nuevas</strong> y <strong>Mi Biblioteca Organizada</strong> arriba, y pulsa <strong>Organizar Automáticamente</strong>.</p>
+            <p class="empty-state-note muted">Tus archivos originales nunca se modifican ni se eliminan.</p>
           </div>
         </div>
       </section>
