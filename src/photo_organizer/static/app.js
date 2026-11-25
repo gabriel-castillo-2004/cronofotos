@@ -46,6 +46,65 @@ async function refreshHealth() {
   };
   container.appendChild(makeBadge("ExifTool", health.exiftool_available));
   container.appendChild(makeBadge("FFmpeg", health.ffmpeg_available));
+
+  const aiModel = health.ai_model || health.model || "gemini-4-hydrogen-medium";
+  if (health.agy_ok) {
+    const aiPill = document.createElement("span");
+    aiPill.className = "badge ok";
+    aiPill.textContent = `IA: agy OK · ${aiModel}`;
+    container.appendChild(aiPill);
+  } else {
+    const aiBtn = document.createElement("button");
+    aiBtn.type = "button";
+    aiBtn.className = "badge warn badge-link";
+    aiBtn.title = "Abrir Configuración para ajustar Antigravity CLI";
+    aiBtn.textContent = "IA: Fallback local (agy no encontrado)";
+    aiBtn.onclick = () => $("btn-settings")?.click();
+    container.appendChild(aiBtn);
+  }
+}
+
+function logActivity(message) {
+  const list = $("activity-log");
+  if (!list) return;
+  const now = new Date().toLocaleTimeString("es-MX", { hour12: false });
+  const li = document.createElement("li");
+  li.textContent = `[${now}] ${message}`;
+  list.prepend(li);
+  while (list.children.length > 60) {
+    list.removeChild(list.lastChild);
+  }
+}
+
+function showToast(message, variant = "ok") {
+  const toast = $("result-toast");
+  if (!toast) return;
+  toast.textContent = message;
+  toast.className = `toast-banner ${variant}`;
+}
+
+function setActionBusy(activeBtnId, busyText) {
+  const actionIds = ["btn-start", "btn-ai-regenerate", "btn-export"];
+  const originals = {};
+  for (const id of actionIds) {
+    const el = $(id);
+    if (!el) continue;
+    originals[id] = el.textContent;
+    el.disabled = true;
+    if (id === activeBtnId && busyText) {
+      el.innerHTML = `<span class="spinner" aria-hidden="true"></span> ${busyText}`;
+    }
+  }
+  return () => {
+    for (const id of actionIds) {
+      const el = $(id);
+      if (!el) continue;
+      el.disabled = false;
+      if (originals[id] !== undefined) {
+        el.textContent = originals[id];
+      }
+    }
+  };
 }
 
 function getBatchOptions() {
@@ -344,17 +403,27 @@ function bindEvents() {
     const source_dir = $("source-dir").value.trim();
     const dest_dir = $("dest-dir").value.trim();
     if (!source_dir || !dest_dir) {
-      return alert("Indica tu Carpeta con fotos nuevas y Mi Biblioteca Organizada.");
+      return showToast("Indica tu Carpeta con fotos nuevas y Mi Biblioteca Organizada.", "warn");
     }
     const { batch_size, solo_primer_lote } = getBatchOptions();
-    const snap = await api("/api/scan/start", "POST", {
-      source_dir,
-      dest_dir,
-      batch_size,
-      solo_primer_lote,
-    });
-    updateProgressUI(snap);
-    connectSSE();
+    const restore = setActionBusy("btn-start", "Organizando...");
+    $("progress-stage").textContent = "Estado: Iniciando organización...";
+    logActivity(`Iniciando organización (${solo_primer_lote ? "modo prueba" : "completa"})`);
+    try {
+      const snap = await api("/api/scan/start", "POST", {
+        source_dir,
+        dest_dir,
+        batch_size,
+        solo_primer_lote,
+      });
+      updateProgressUI(snap);
+      connectSSE();
+    } catch (err) {
+      showToast(`Error al iniciar: ${err.message}`, "warn");
+      logActivity(`Error al iniciar: ${err.message}`);
+    } finally {
+      restore();
+    }
   };
 
   if ($("btn-pause")) {
@@ -436,9 +505,24 @@ function bindEvents() {
 
   if ($("btn-ai-regenerate")) {
     $("btn-ai-regenerate").onclick = async () => {
-      if (!state.jobId) return alert("Primero ejecuta Organizar Automáticamente.");
-      await api("/api/ai/regenerate", "POST", { job_id: state.jobId });
-      await loadTree();
+      if (!state.jobId) return showToast("Primero ejecuta Organizar Automáticamente.", "warn");
+      const restore = setActionBusy("btn-ai-regenerate", "Regenerando nombres con IA...");
+      $("progress-stage").textContent = "Estado: Regenerando nombres con IA...";
+      logActivity("Regenerando nombres de carpetas con IA...");
+      try {
+        const res = await api("/api/ai/regenerate", "POST", { job_id: state.jobId });
+        const engine = res.engine || res.model || "Fallback local";
+        const msg = `Nombres actualizados (${res.updated_folders || 0} carpetas) usando ${engine}.`;
+        $("progress-stage").textContent = `Estado: ${msg}`;
+        showToast(msg, "ok");
+        logActivity(msg);
+        await loadTree();
+      } catch (err) {
+        showToast(`Error al regenerar nombres: ${err.message}`, "warn");
+        logActivity(`Error al regenerar nombres: ${err.message}`);
+      } finally {
+        restore();
+      }
     };
   }
 
@@ -479,20 +563,50 @@ function bindEvents() {
   };
 
   $("btn-export").onclick = async () => {
-    if (!state.jobId) return alert("Primero ejecuta Organizar Automáticamente.");
+    if (!state.jobId) return showToast("Primero ejecuta Organizar Automáticamente.", "warn");
     if (!confirm("¿Aplicar y Exportar Árbol al directorio destino?")) return;
     const { batch_size, solo_primer_lote } = getBatchOptions();
-    const res = await api("/api/export", "POST", {
-      job_id: state.jobId,
-      batch_size,
-      solo_primer_lote,
-    });
-    if (Array.isArray(res.batches)) {
-      renderBatches(res.batches);
+    const restore = setActionBusy("btn-export", "Exportando archivos...");
+    $("progress-stage").textContent = "Estado: Exportando archivos...";
+    logActivity("Iniciando exportación física al directorio destino...");
+    try {
+      const res = await api("/api/export", "POST", {
+        job_id: state.jobId,
+        batch_size,
+        solo_primer_lote,
+      });
+      if (Array.isArray(res.batches)) {
+        renderBatches(res.batches);
+      }
+      const msg = `Exportación completa: ${res.exported} exportados, ${res.duplicates} duplicados, ${res.skipped} omitidos.`;
+      $("progress-stage").textContent = `Estado: ${msg}`;
+      showToast(msg, "ok");
+      logActivity(msg);
+      if ($("btn-open-dest")) {
+        $("btn-open-dest").classList.remove("hidden");
+      }
+      await loadTree();
+    } catch (err) {
+      showToast(`Error al exportar: ${err.message}`, "warn");
+      logActivity(`Error al exportar: ${err.message}`);
+    } finally {
+      restore();
     }
-    alert(`Exportación completa: ${res.exported} exportados, ${res.duplicates} duplicados, ${res.skipped} omitidos.`);
-    await loadTree();
   };
+
+  if ($("btn-open-dest")) {
+    $("btn-open-dest").onclick = async () => {
+      try {
+        await api("/api/open-destination", "POST", {
+          job_id: state.jobId,
+          path: $("dest-dir").value.trim() || null,
+        });
+        logActivity("Carpeta destino abierta en el explorador.");
+      } catch (err) {
+        showToast(`No se pudo abrir la carpeta: ${err.message}`, "warn");
+      }
+    };
+  }
 }
 
 refreshHealth();

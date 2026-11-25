@@ -67,6 +67,7 @@
         <div class="primary-actions">
           <button id="btn-ai-regenerate" type="button" class="btn secondary">Regenerar nombres con IA</button>
           <button id="btn-export" type="button" class="btn primary">Aplicar y Exportar Árbol</button>
+          <button id="btn-open-dest" type="button" class="btn secondary hidden">Abrir carpeta destino</button>
         </div>
 
         <details id="advanced-menu" class="advanced-menu">
@@ -76,7 +77,6 @@
               <div class="scan-buttons">
                 <button id="btn-pause" type="button" class="btn small" disabled>Pausar</button>
                 <button id="btn-resume" type="button" class="btn small" disabled>Reanudar</button>
-                <button id="btn-ai-classify" type="button" class="btn small">Clasificar con IA</button>
               </div>
               <div class="batch-controls">
                 <label class="batch-size-label">
@@ -87,10 +87,6 @@
                     <option value="250">250</option>
                     <option value="500">500</option>
                   </select>
-                </label>
-                <label class="checkbox-label">
-                  <input id="chk-solo-lote-adv" type="checkbox" />
-                  <span>Probar solo 1 lote</span>
                 </label>
               </div>
             </div>
@@ -109,6 +105,13 @@
           </div>
         </details>
       </div>
+
+      <div id="result-toast" class="toast-banner hidden" role="status" aria-live="polite"></div>
+
+      <details id="activity-log-panel" class="activity-panel">
+        <summary>Actividad en vivo</summary>
+        <ul id="activity-log" class="activity-log"></ul>
+      </details>
     </section>
 
     <main class="workspace">

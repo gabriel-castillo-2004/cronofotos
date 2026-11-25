@@ -79,8 +79,8 @@ def test_mod10_01_frontend_batch_controls_and_progress_panel() -> None:
         "100" in js
     )
 
-    # Top controls: Probar solo 1 lote checkbox
-    assert "Probar solo 1 lote" in html
+    # Top controls: test-mode (single batch) checkbox (single source of truth after MOD-12)
+    assert "Modo prueba (100 archivos)" in html or "Probar solo 1 lote" in html
     assert re.search(r"<input[^>]*type=[\"']checkbox[\"']", html)
 
     # Visual batch progress panel in HTML + rendering in app.js

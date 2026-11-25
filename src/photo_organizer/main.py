@@ -13,6 +13,7 @@ import json
 import mimetypes
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from photo_organizer.ai_classifier import DEFAULT_AGY_MODEL, GeminiClassifier, classify_with_agy
+from photo_organizer.clustering import offline_reverse_geocode
 from photo_organizer.config import OrganizerConfig, resolve_cli_binary, validate_source_dest_pair
 from photo_organizer.db import init_db, open_connection, recompute_filenames
 from photo_organizer.exporter import run_two_phase_export
@@ -109,11 +111,21 @@ class _LocalAppCore:
 
     def health(self) -> dict[str, Any]:
         status = BinaryHealthCheck.check(self.cfg.exiftool_path, self.cfg.ffmpeg_path)
+        agy_cmd = self.state.get("antigravity_cli") or "agy"
+        agy_path = resolve_cli_binary(agy_cmd)
+        agy_ok = bool(agy_path)
+        model = self.state.get("model") or DEFAULT_AGY_MODEL
         return {
             "exiftool_available": status.exiftool_available,
             "exiftool_path": status.exiftool_path,
             "ffmpeg_available": status.ffmpeg_available,
             "ffmpeg_path": status.ffmpeg_path,
+            "agy_ok": agy_ok,
+            "ai_ok": agy_ok,
+            "agy_path": agy_path,
+            "antigravity_cli": agy_cmd,
+            "ai_model": model,
+            "model": model,
             "warnings": status.warnings,
         }
 
@@ -420,10 +432,16 @@ class _LocalAppCore:
         )
 
     def regenerate_ai_names(self, job_id: str) -> dict[str, Any]:
-        """Re-run AI folder naming on all 01_Recuerdos/ event folders for a job."""
+        """Invalidate AI name cache and re-run AI folder naming on 01_Recuerdos/ folders."""
         conn = open_connection(self.cfg.db_path)
         updated = 0
+        total_folders = 0
+        cli_cmd = self.state["antigravity_cli"]
+        model = self.state["model"]
+        agy_available = bool(resolve_cli_binary(cli_cmd))
         try:
+            with conn:
+                conn.execute("DELETE FROM ai_cache")
             rows = conn.execute(
                 """
                 SELECT target_folder, COUNT(*) AS cnt, MIN(source_path) AS sample_path,
@@ -434,6 +452,7 @@ class _LocalAppCore:
                 """,
                 (job_id,),
             ).fetchall()
+            total_folders = len(rows)
             with conn:
                 for row in rows:
                     old_folder = str(row["target_folder"])
@@ -443,16 +462,17 @@ class _LocalAppCore:
                     year_part = parts[1]
                     ym_prefix = parts[2].split(" - ")[0]
                     orig_parent = Path(str(row["sample_path"])).parent.name
+                    loc_label = offline_reverse_geocode(row["avg_lat"], row["avg_lon"])
                     gps_txt = (
-                        f" | GPS: {row['avg_lat']:.2f},{row['avg_lon']:.2f}"
-                        if row["avg_lat"] is not None and row["avg_lon"] is not None
+                        f" | GPS: {loc_label}"
+                        if loc_label and not loc_label.startswith("GPS ")
                         else ""
                     )
                     summary = f"{ym_prefix} | {row['cnt']} fotos | carpeta: {orig_parent}{gps_txt}"
                     ai_name = classify_with_agy(
                         summary,
-                        cli_command=self.state["antigravity_cli"],
-                        model=self.state["model"],
+                        cli_command=cli_cmd,
+                        model=model,
                     )
                     safe_ai = "".join("_" if c in '<>:"/\\|?*' else c for c in ai_name).strip()
                     if not safe_ai:
@@ -467,7 +487,40 @@ class _LocalAppCore:
                         updated += 1
         finally:
             conn.close()
-        return {"job_id": job_id, "updated_folders": updated}
+        engine_name = f"agy · {model}" if agy_available else "Fallback local"
+        return {
+            "job_id": job_id,
+            "updated_folders": updated,
+            "total_folders": total_folders,
+            "cache_cleared": True,
+            "engine": engine_name,
+            "ai_engine": "agy" if agy_available else "fallback_local",
+            "model": model,
+        }
+
+    def open_destination(self, job_id: str | None = None, path: str | None = None) -> dict[str, Any]:
+        """Open the destination library directory in the local OS file explorer."""
+        dest_str = (path or "").strip()
+        if not dest_str and job_id:
+            conn = open_connection(self.cfg.db_path)
+            try:
+                row = conn.execute("SELECT dest_dir FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if row:
+                    dest_str = str(row["dest_dir"])
+            finally:
+                conn.close()
+        if not dest_str:
+            raise _ApiError(400, "No destination directory specified")
+        dest_path = Path(dest_str)
+        if not dest_path.exists():
+            raise _ApiError(404, "Destination directory does not exist")
+        if os.name == "nt":
+            os.startfile(str(dest_path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(dest_path)])
+        else:
+            subprocess.Popen(["xdg-open", str(dest_path)])
+        return {"opened": True, "path": str(dest_path)}
 
     def export_tree(
         self,
@@ -548,6 +601,10 @@ if FASTAPI_AVAILABLE:
         job_id: str
         batch_size: int = Field(default=100, ge=1)
         solo_primer_lote: bool = False
+
+    class OpenDestinationRequest(BaseModel):
+        job_id: str | None = None
+        path: str | None = None
 
 
 def create_app(config: OrganizerConfig | None = None) -> Any:
@@ -697,6 +754,13 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
                 payload.batch_size,
                 payload.solo_primer_lote,
             )
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/api/open-destination")
+    async def open_destination(payload: OpenDestinationRequest) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(core.open_destination, payload.job_id, payload.path)
         except _ApiError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
@@ -854,6 +918,11 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                             batch_size=int(body.get("batch_size") or 100),
                             solo_primer_lote=bool(body.get("solo_primer_lote", False)),
                         ),
+                    )
+                elif path == "/api/open-destination":
+                    self._send_json(
+                        200,
+                        core.open_destination(body.get("job_id"), body.get("path")),
                     )
                 else:
                     self._send_json(404, {"detail": "Not found"})

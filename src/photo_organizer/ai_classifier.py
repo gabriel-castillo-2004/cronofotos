@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import time
@@ -15,10 +16,100 @@ from photo_organizer.db import init_db, open_connection
 DEFAULT_AGY_MODEL = "gemini-4-hydrogen-medium"
 _ORIG_SUBPROCESS_RUN = subprocess.run
 
+_GENERIC_FOLDER_NAMES = frozenset(
+    {
+        "onedrivefotos",
+        "onedrive",
+        "camera",
+        "dcim",
+        "pictures",
+        "imagenes",
+        "imágenes",
+        "fotos",
+        "photos",
+        "camera roll",
+        "rollo de cámara",
+        "mis imagenes",
+        "mis imágenes",
+        "sin_carpeta",
+        "unknown",
+        "media",
+        "backup",
+        "takeout",
+        "google fotos",
+        "google photos",
+    }
+)
+
+
+def _clean_label(raw: str) -> str:
+    """Sanitize an event label and strip template/punctuation artifacts."""
+    cleaned = raw.strip().strip("\"'`")
+    cleaned = re.sub(r"Fotos_Carpeta__Gps_[^\s]*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[<>:\"/\\|?*]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:60]
+
+
+def _parse_agy_output(stdout: str) -> str:
+    """Extract event name from JSON or plain-text `agy` output."""
+    text = (stdout or "").strip()
+    if not text:
+        return ""
+
+    # Strip optional markdown code fences
+    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    candidate = fence_match.group(1).strip() if fence_match else text
+
+    # Try direct JSON or embedded JSON object
+    json_candidates = [candidate]
+    obj_match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+    if obj_match:
+        json_candidates.append(obj_match.group(0))
+
+    for jc in json_candidates:
+        try:
+            parsed = json.loads(jc)
+            if isinstance(parsed, dict):
+                for key in ("nombre_evento", "event_name", "nombre", "evento", "label"):
+                    val = parsed.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return _clean_label(val)
+        except json.JSONDecodeError:
+            continue
+
+    first_line = next((ln.strip() for ln in candidate.splitlines() if ln.strip()), "")
+    return _clean_label(first_line)
+
 
 def heuristic_classify(prompt_key: str) -> str:
-    """Derive a clean Spanish category/event label from folder and filename metadata."""
-    lower = (prompt_key or "").lower()
+    """Derive a clean Spanish category/event label from folder, GPS, or filename metadata."""
+    raw = (prompt_key or "").strip()
+    if not raw:
+        return "Eventos del día"
+
+    # Handle structured event summaries: "YYYY-MM-DD | N fotos | carpeta: X | GPS: Y"
+    if "|" in raw and ("carpeta:" in raw.lower() or "gps:" in raw.lower()):
+        folder_match = re.search(r"carpeta:\s*([^|]+)", raw, flags=re.IGNORECASE)
+        gps_match = re.search(r"gps:\s*([^|]+)", raw, flags=re.IGNORECASE)
+        folder_name = folder_match.group(1).strip() if folder_match else ""
+        gps_val = gps_match.group(1).strip() if gps_match else ""
+
+        if folder_name and folder_name.lower() not in _GENERIC_FOLDER_NAMES:
+            tokens = [
+                t
+                for t in re.split(r"[\s_\-]+", folder_name)
+                if t and not t.isdigit() and len(t) > 1
+            ]
+            if tokens:
+                return _clean_label(" ".join(t.capitalize() for t in tokens[:4]))
+
+        if gps_val and not re.match(r"^(?:gps\s*)?-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?$", gps_val, re.IGNORECASE):
+            return _clean_label(gps_val)
+
+        return "Eventos del día"
+
+    lower = raw.lower()
     rules = (
         (("screenshot", "captura", "pantallazo", "screen_shot"), "Capturas"),
         (("whatsapp", "-wa0", "wa_"), "WhatsApp"),
@@ -26,24 +117,25 @@ def heuristic_classify(prompt_key: str) -> str:
         (("instagram",), "Instagram"),
         (("download", "descarga"), "Descargas"),
         (("document", "scan", "recibo", "factura", "pdf"), "Documentos"),
-        (("camera", "dcim"), "Camara"),
         (("viaje", "trip", "travel", "vacacion", "playa", "beach"), "Viaje"),
     )
     for keywords, label in rules:
         if any(kw in lower for kw in keywords):
             return label
 
-    parts = [p for p in re.split(r"[/\\]+", prompt_key or "") if p]
+    parts = [p for p in re.split(r"[/\\]+", raw) if p]
     for part in parts:
         stem = Path(part).stem
+        if stem.lower() in _GENERIC_FOLDER_NAMES:
+            continue
         tokens = [
             t
             for t in re.split(r"[\s_\-]+", stem)
             if t and not t.isdigit() and len(t) > 2
         ]
         if tokens:
-            return "_".join(t.capitalize() for t in tokens[:3])
-    return "Evento_Local"
+            return _clean_label(" ".join(t.capitalize() for t in tokens[:3]))
+    return "Eventos del día"
 
 
 def classify_with_agy(
@@ -61,8 +153,10 @@ def classify_with_agy(
 
     selected_model = (model or DEFAULT_AGY_MODEL).strip() or DEFAULT_AGY_MODEL
     prompt = (
-        "Responde únicamente con una etiqueta corta de 1 a 3 palabras en español "
-        f"(sin puntuación extra) para clasificar este archivo o carpeta: {prompt_key}"
+        "Responde únicamente con un JSON válido de la forma "
+        '{"nombre_evento": "Nombre Corto en Español"} '
+        "(máximo 3 palabras, sin explicación adicional) para este grupo de fotos: "
+        f"{prompt_key}"
     )
     try:
         proc = subprocess.run(
@@ -73,12 +167,9 @@ def classify_with_agy(
             check=False,
         )
         if proc.returncode == 0 and proc.stdout:
-            first_line = next(
-                (ln.strip() for ln in proc.stdout.splitlines() if ln.strip()),
-                "",
-            )
-            if first_line:
-                return first_line[:60]
+            parsed = _parse_agy_output(proc.stdout)
+            if parsed:
+                return parsed
     except (OSError, subprocess.SubprocessError):
         pass
     return heuristic_classify(prompt_key)

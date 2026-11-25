@@ -603,6 +603,78 @@ progress {
   }
 }
 
+.badge-link {
+  border: 1px solid currentColor;
+  cursor: pointer;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.spinner {
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  vertical-align: middle;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.toast-banner {
+  padding: 0.55rem 0.85rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.toast-banner.ok {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.toast-banner.warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.activity-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem 0.75rem;
+  background: var(--panel);
+}
+
+.activity-panel summary {
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.activity-log {
+  list-style: none;
+  margin: 0.5rem 0 0 0;
+  padding: 0;
+  max-height: 150px;
+  overflow-y: auto;
+  font-size: 0.78rem;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
 @media (max-width: 480px) {
   .controls-panel,
   .topbar {

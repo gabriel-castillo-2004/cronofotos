@@ -51,7 +51,7 @@ class ThumbnailCache:
     def _disk_path(self, opaque_id: str, sha256: str | None) -> Path:
         key = sha256 if sha256 else opaque_id
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in key)
-        return self.cache_dir / f"{safe}.jpg"
+        return self.cache_dir / f"v2_exif_{safe}.jpg"
 
     def _put_ram(self, key: str, data: bytes) -> None:
         with self._lock:
