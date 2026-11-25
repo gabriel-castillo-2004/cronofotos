@@ -517,7 +517,7 @@ function bindEvents() {
     const gpsDistEl = $("gps-distance-km");
     const time_gap_hours = timeGapEl ? Math.max(0.5, Number(timeGapEl.value) || 4) : 4;
     const gps_distance_km = gpsDistEl ? Math.max(1, Number(gpsDistEl.value) || 25) : 25;
-    const incremental_mode = Boolean($("incremental-mode")?.checked);
+    const incremental_mode = Boolean($("incremental-mode")?.checked || $("delta-mode")?.checked);
     const master_index_path = $("master-index-path")?.value.trim() || null;
     try {
       const snap = await api("/api/scan/start", "POST", {
@@ -1087,11 +1087,49 @@ function bindEvents() {
     }
   };
 
+  if ($("incremental-mode") && $("delta-mode")) {
+    $("incremental-mode").onchange = () => {
+      $("delta-mode").checked = $("incremental-mode").checked;
+    };
+    $("delta-mode").onchange = () => {
+      $("incremental-mode").checked = $("delta-mode").checked;
+    };
+  }
+
+  if ($("btn-refine-tree")) {
+    $("btn-refine-tree").onclick = async () => {
+      const destDir = $("dest-dir")?.value.trim() || null;
+      if (!state.jobId && !destDir) {
+        return showToast("Indica Mi Biblioteca Organizada o ejecuta un trabajo previo.", "warn");
+      }
+      if (!confirm("¿Refinar en sitio el árbol ya exportado usando _cronofotos_plan.json?")) return;
+      const restore = setActionBusy("btn-refine-tree", "Refinando árbol...");
+      logActivity("Iniciando refinamiento en sitio del árbol ya exportado...");
+      try {
+        const res = await api("/api/tree/refine", "POST", {
+          job_id: state.jobId || null,
+          dest_dir: destDir,
+        });
+        const msg = `Árbol refinado en sitio: ${res.moved || 0} archivos reubicados, ${res.removed_empty_dirs || 0} carpetas vacías eliminadas.`;
+        showToast(msg, "ok");
+        logActivity(msg);
+        if (state.jobId) {
+          await loadTree();
+        }
+      } catch (err) {
+        showToast(`Error al refinar árbol: ${err.message}`, "warn");
+        logActivity(`Error al refinar árbol: ${err.message}`);
+      } finally {
+        restore();
+      }
+    };
+  }
+
   $("btn-export").onclick = async () => {
     if (!state.jobId) return showToast("Primero ejecuta Organizar Automáticamente.", "warn");
     if (!confirm("¿Aplicar y Exportar Árbol al directorio destino?")) return;
     const { batch_size, solo_primer_lote } = getBatchOptions();
-    const incremental_mode = Boolean($("incremental-mode")?.checked);
+    const incremental_mode = Boolean($("incremental-mode")?.checked || $("delta-mode")?.checked);
     const master_index_path = $("master-index-path")?.value.trim() || null;
     const restore = setActionBusy("btn-export", "Exportando archivos...");
     $("progress-stage").textContent = "Estado: Exportando archivos...";

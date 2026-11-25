@@ -29,6 +29,8 @@ from photo_organizer.sidecar import build_json_index, merge_metadata, resolve_si
 
 INDEX_FILENAME = "_cronofotos_index.json"
 MASTER_INDEX_FILENAME = "master_index.json"
+PORTABLE_PLAN_FILENAME = "_cronofotos_plan.json"
+MASTER_PLAN_FILENAME = "master_plan.json"
 VALID_BATCH_SIZES = (50, 100, 250, 500)
 DEFAULT_BATCH_SIZE = 100
 
@@ -75,6 +77,57 @@ def load_index_file(index_path: Path) -> dict[str, dict[str, Any]]:
     return {}
 
 
+def load_plan_as_index(plan_path: Path) -> dict[str, dict[str, Any]]:
+    """Load a _cronofotos_plan.json or master_plan.json file as a SHA-256 index dict."""
+    if not plan_path.is_file():
+        return {}
+    try:
+        loaded = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    files_obj = loaded.get("files") or loaded.get("sha256_map") or loaded.get("items")
+    result: dict[str, dict[str, Any]] = {}
+    if isinstance(files_obj, dict):
+        for sha, val in files_obj.items():
+            sha_str = str(sha).strip()
+            if not sha_str:
+                continue
+            folder = val if isinstance(val, str) else ""
+            if isinstance(val, dict):
+                folder = str(val.get("target_folder") or val.get("folder") or "")
+            result[sha_str] = {
+                "rel_path": folder,
+                "size_bytes": None,
+                "from_plan": True,
+            }
+    elif isinstance(files_obj, list):
+        for item in files_obj:
+            if not isinstance(item, dict):
+                continue
+            sha_str = str(item.get("sha256") or "").strip()
+            if not sha_str:
+                continue
+            folder = str(item.get("target_folder") or item.get("folder") or "")
+            result[sha_str] = {
+                "rel_path": folder,
+                "size_bytes": None,
+                "from_plan": True,
+            }
+    return result
+
+
+def load_index_or_plan_file(path: Path) -> dict[str, dict[str, Any]]:
+    """Load either a CronoFotos index JSON or a portable plan JSON as a SHA-256 index."""
+    if not path.is_file():
+        return {}
+    plan_entries = load_plan_as_index(path)
+    if plan_entries:
+        return plan_entries
+    return load_index_file(path)
+
+
 def save_library_index(dest_dir: Path, index: dict[str, dict[str, Any]]) -> None:
     """Persist _cronofotos_index.json atomically inside dest_dir."""
     save_index_file(dest_dir / INDEX_FILENAME, index)
@@ -85,10 +138,11 @@ def load_master_index(
     data_dir: Path,
     custom_index_path: str | Path | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Load and merge historical SHA-256 indexes from dest_dir, data_dir, and optional custom path."""
+    """Load and merge historical SHA-256 indexes and plans from dest_dir, data_dir, and optional custom path."""
     merged: dict[str, dict[str, Any]] = {}
-    master_file = data_dir / MASTER_INDEX_FILENAME
-    merged.update(load_index_file(master_file))
+    merged.update(load_index_file(data_dir / MASTER_INDEX_FILENAME))
+    merged.update(load_plan_as_index(data_dir / MASTER_PLAN_FILENAME))
+    merged.update(load_plan_as_index(data_dir / PORTABLE_PLAN_FILENAME))
 
     if custom_index_path:
         raw = str(custom_index_path).strip()
@@ -98,11 +152,18 @@ def load_master_index(
                 for name in (INDEX_FILENAME, MASTER_INDEX_FILENAME):
                     if (cand / name).is_file():
                         merged.update(load_index_file(cand / name))
+                for name in (PORTABLE_PLAN_FILENAME, MASTER_PLAN_FILENAME):
+                    if (cand / name).is_file():
+                        merged.update(load_plan_as_index(cand / name))
             elif cand.is_file():
-                merged.update(load_index_file(cand))
+                merged.update(load_index_or_plan_file(cand))
 
     if dest_dir.exists():
         merged.update(load_library_index(dest_dir))
+        if (dest_dir / PORTABLE_PLAN_FILENAME).is_file():
+            for sha, entry in load_plan_as_index(dest_dir / PORTABLE_PLAN_FILENAME).items():
+                if sha not in merged:
+                    merged[sha] = entry
     return merged
 
 
@@ -130,7 +191,12 @@ def load_library_index(dest_dir: Path) -> dict[str, dict[str, Any]]:
     for existing in sorted(dest_dir.rglob("*")):
         if not existing.is_file():
             continue
-        if existing.name in {INDEX_FILENAME, f"{INDEX_FILENAME}.tmp"} or existing.suffix == ".tmp":
+        if existing.name in {
+            INDEX_FILENAME,
+            f"{INDEX_FILENAME}.tmp",
+            PORTABLE_PLAN_FILENAME,
+            f"{PORTABLE_PLAN_FILENAME}.tmp",
+        } or existing.suffix == ".tmp":
             continue
         if "_Duplicados" in existing.parts:
             continue

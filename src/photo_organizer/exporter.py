@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -15,7 +17,9 @@ from photo_organizer.config import IGNORED_SIDECAR_EXTENSIONS, to_win_long_path
 from photo_organizer.db import open_connection, recompute_filenames
 from photo_organizer.media import MediaMetadataService
 from photo_organizer.worker import (
+    INDEX_FILENAME,
     MASTER_INDEX_FILENAME,
+    MASTER_PLAN_FILENAME,
     compute_sha256_streaming,
     load_index_file,
     load_library_index,
@@ -186,10 +190,18 @@ def import_portable_plan(
     try:
         with conn:
             for sha, target_folder in sha_map.items():
+                old_rows = conn.execute(
+                    """
+                    SELECT DISTINCT target_folder
+                    FROM media_items
+                    WHERE job_id = ? AND sha256 = ? AND target_folder != ?
+                    """,
+                    (job_id, sha, target_folder),
+                ).fetchall()
                 cur = conn.execute(
                     """
                     UPDATE media_items
-                    SET target_folder = ?
+                    SET target_folder = ?, target_filename = '__plan_tmp_' || id
                     WHERE job_id = ? AND sha256 = ? AND target_folder != ?
                     """,
                     (target_folder, job_id, sha, target_folder),
@@ -197,6 +209,8 @@ def import_portable_plan(
                 if cur.rowcount > 0:
                     updated_items += cur.rowcount
                     touched_folders.add(target_folder)
+                    for orow in old_rows:
+                        touched_folders.add(str(orow["target_folder"]))
 
             for folder in sorted(touched_folders):
                 recompute_filenames(conn, job_id, folder)
@@ -480,4 +494,249 @@ def run_two_phase_export(
         "batch_size": eff_batch_size,
         "solo_primer_lote": solo_primer_lote,
         "batches": batches_info,
+    }
+
+
+def _next_available_path(target_dir: Path, filename: str, reserved: set[Path]) -> Path:
+    """Return a collision-free path inside target_dir, recalculating ### suffix if needed."""
+    candidate = target_dir / filename
+    if candidate not in reserved and not candidate.exists():
+        reserved.add(candidate)
+        return candidate
+    stem = Path(filename).stem
+    ext = Path(filename).suffix
+    match = re.match(r"^(.*)_(\d{3})$", stem)
+    if match:
+        base_stem = match.group(1)
+        counter = int(match.group(2))
+    else:
+        base_stem = stem
+        counter = 0
+    while True:
+        counter += 1
+        alt = target_dir / f"{base_stem}_{counter:03d}{ext}"
+        if alt not in reserved and not alt.exists():
+            reserved.add(alt)
+            return alt
+
+
+def _safe_move_win(src: Path, dst: Path) -> None:
+    """Move a file safely on Windows supporting long paths."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(to_win_long_path(src), to_win_long_path(dst))
+    except OSError:
+        shutil.move(to_win_long_path(src), to_win_long_path(dst))
+
+
+def _remove_empty_dirs(root_dir: Path) -> int:
+    """Remove residual empty directories inside root_dir bottom-up."""
+    removed = 0
+    if not root_dir.exists():
+        return 0
+    for dirpath, _dirnames, _filenames in os.walk(root_dir, topdown=False):
+        p = Path(dirpath)
+        if p == root_dir:
+            continue
+        try:
+            if not any(p.iterdir()):
+                p.rmdir()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def refine_exported_tree(
+    db_path: Path,
+    dest_dir: Path,
+    *,
+    job_id: str | None = None,
+    plan_data: dict[str, Any] | None = None,
+    plan_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Relocate already-exported files in-place within dest_dir according to _cronofotos_plan.json."""
+    if not dest_dir.exists() or not dest_dir.is_dir():
+        raise FileNotFoundError(f"La Carpeta Destino no existe: {dest_dir}")
+
+    resolved_plan_path = Path(plan_path) if plan_path else (dest_dir / PORTABLE_PLAN_FILENAME)
+    if plan_data is None:
+        if not resolved_plan_path.is_file():
+            raise FileNotFoundError(f"No se encontró el plan: {resolved_plan_path}")
+        plan_data = json.loads(resolved_plan_path.read_text(encoding="utf-8"))
+    if not isinstance(plan_data, dict):
+        raise ValueError("El plan debe ser un objeto JSON válido")
+
+    # 1. Index all media files currently on disk inside dest_dir without touching source_dir
+    lib_index = load_library_index(dest_dir)
+    disk_by_sha: dict[str, Path] = {}
+    tracked_paths: set[Path] = set()
+    for sha, info in lib_index.items():
+        if not isinstance(info, dict):
+            continue
+        rel = info.get("rel_path")
+        if not rel:
+            continue
+        cand = dest_dir / str(rel)
+        if cand.is_file():
+            disk_by_sha[str(sha)] = cand
+            tracked_paths.add(cand.resolve())
+
+    for existing in sorted(dest_dir.rglob("*")):
+        if not existing.is_file():
+            continue
+        if existing.name in {
+            INDEX_FILENAME,
+            f"{INDEX_FILENAME}.tmp",
+            PORTABLE_PLAN_FILENAME,
+            f"{PORTABLE_PLAN_FILENAME}.tmp",
+        } or existing.suffix == ".tmp":
+            continue
+        if "_Duplicados" in existing.parts:
+            continue
+        if existing.resolve() in tracked_paths:
+            continue
+        sha = compute_sha256_streaming(existing)
+        disk_by_sha[sha] = existing
+        tracked_paths.add(existing.resolve())
+
+    # 2. Sync plan into SQLite and recompute deterministic ### filenames if job_id is present
+    desired_by_sha: dict[str, tuple[str, str]] = {}
+    if job_id:
+        import_portable_plan(db_path, job_id, plan_data)
+        conn = open_connection(db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT sha256, target_folder, target_filename
+                FROM media_items
+                WHERE job_id = ? AND is_duplicate = 0 AND is_placeholder = 0
+                  AND sha256 IS NOT NULL AND sha256 != ''
+                ORDER BY target_folder ASC, target_filename ASC
+                """,
+                (job_id,),
+            ).fetchall()
+            for r in rows:
+                sha = str(r["sha256"])
+                if sha not in desired_by_sha:
+                    desired_by_sha[sha] = (str(r["target_folder"]), str(r["target_filename"]))
+        finally:
+            conn.close()
+
+    plan_sha_map = _extract_sha_folder_pairs(plan_data)
+    for sha, folder in plan_sha_map.items():
+        if sha not in desired_by_sha and sha in disk_by_sha:
+            desired_by_sha[sha] = (folder, disk_by_sha[sha].name)
+
+    # 3. Determine files that need relocation and execute two-phase Windows-safe move
+    pending_moves: list[tuple[str, Path, Path, str]] = []
+    reserved_paths: set[Path] = set()
+    for sha, current_path in disk_by_sha.items():
+        if sha not in desired_by_sha:
+            reserved_paths.add(current_path)
+            continue
+        target_folder, target_filename = desired_by_sha[sha]
+        target_dir = dest_dir / target_folder
+        desired_path = target_dir / target_filename
+        if current_path.relative_to(dest_dir).as_posix() == f"{target_folder}/{target_filename}":
+            reserved_paths.add(current_path)
+            continue
+        pending_moves.append((sha, current_path, target_dir, target_filename))
+
+    staged_temps: list[tuple[str, Path, Path, str]] = []
+    for sha, current_path, target_dir, target_filename in pending_moves:
+        tmp_path = current_path.parent / f"._refine_{uuid.uuid4().hex[:8]}_{current_path.name}.tmp"
+        _safe_move_win(current_path, tmp_path)
+        staged_temps.append((sha, tmp_path, target_dir, target_filename))
+
+    moved_count = 0
+    filename_updates: list[tuple[str, str]] = []
+    for sha, tmp_path, target_dir, target_filename in staged_temps:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        final_path = _next_available_path(target_dir, target_filename, reserved_paths)
+        _safe_move_win(tmp_path, final_path)
+        disk_by_sha[sha] = final_path
+        moved_count += 1
+        if final_path.name != target_filename:
+            filename_updates.append((final_path.name, sha))
+
+    if job_id and filename_updates:
+        conn = open_connection(db_path)
+        try:
+            with conn:
+                for new_name, sha in filename_updates:
+                    conn.execute(
+                        "UPDATE media_items SET target_filename = ? WHERE job_id = ? AND sha256 = ?",
+                        (new_name, job_id, sha),
+                    )
+        finally:
+            conn.close()
+
+    # 4. Remove residual empty directories
+    removed_dirs = _remove_empty_dirs(dest_dir)
+
+    # 5. Update _cronofotos_index.json, _cronofotos_plan.json, and <data_dir>/master_plan.json
+    now_iso = datetime.now(timezone.utc).isoformat()
+    new_index: dict[str, dict[str, Any]] = {}
+    for sha, fpath in sorted(disk_by_sha.items()):
+        if not fpath.is_file():
+            continue
+        new_index[sha] = {
+            "rel_path": fpath.relative_to(dest_dir).as_posix(),
+            "size_bytes": fpath.stat().st_size,
+            "indexed_at": now_iso,
+        }
+    save_library_index(dest_dir, new_index)
+
+    master_idx_path = db_path.parent / MASTER_INDEX_FILENAME
+    master_idx = load_index_file(master_idx_path)
+    master_idx.update(new_index)
+    save_index_file(master_idx_path, master_idx)
+
+    if job_id:
+        updated_plan = build_portable_plan(db_path, job_id)
+    else:
+        updated_plan = {
+            "version": int(plan_data.get("version") or 1),
+            "updated_at": now_iso,
+            "files": dict(plan_sha_map),
+            "folders": plan_data.get("folders") if isinstance(plan_data.get("folders"), dict) else {},
+            "debate_history": plan_data.get("debate_history") if isinstance(plan_data.get("debate_history"), list) else [],
+        }
+    for sha, folder in plan_sha_map.items():
+        if sha not in updated_plan["files"]:
+            updated_plan["files"][sha] = folder
+
+    dest_plan_path = dest_dir / PORTABLE_PLAN_FILENAME
+    save_portable_plan_atomic(dest_plan_path, updated_plan)
+
+    master_plan_path = db_path.parent / MASTER_PLAN_FILENAME
+    existing_master_plan: dict[str, Any] = {}
+    if master_plan_path.is_file():
+        try:
+            loaded_mp = json.loads(master_plan_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_mp, dict):
+                existing_master_plan = loaded_mp
+        except (OSError, json.JSONDecodeError):
+            existing_master_plan = {}
+    merged_master_files: dict[str, str] = {}
+    if isinstance(existing_master_plan.get("files"), dict):
+        merged_master_files.update(existing_master_plan["files"])
+    merged_master_files.update(updated_plan.get("files", {}))
+    master_plan_payload = {
+        "version": int(existing_master_plan.get("version") or 1),
+        "updated_at": now_iso,
+        "files": merged_master_files,
+        "folders": updated_plan.get("folders", {}),
+    }
+    save_portable_plan_atomic(master_plan_path, master_plan_payload)
+
+    return {
+        "refined": True,
+        "moved": moved_count,
+        "total_files": len(new_index),
+        "removed_empty_dirs": removed_dirs,
+        "index_path": str(dest_dir / INDEX_FILENAME),
+        "plan_path": str(dest_plan_path),
+        "master_plan_path": str(master_plan_path),
     }

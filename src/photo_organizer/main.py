@@ -50,6 +50,7 @@ from photo_organizer.exporter import (
     PORTABLE_PLAN_FILENAME,
     export_portable_plan,
     import_portable_plan,
+    refine_exported_tree,
     run_two_phase_export,
 )
 from photo_organizer.media import BinaryHealthCheck, MediaMetadataService
@@ -1115,6 +1116,38 @@ class _LocalAppCore:
         res["plan_path"] = str(resolved_path)
         return res
 
+    def refine_tree(
+        self,
+        job_id: str | None = None,
+        dest_dir: str | None = None,
+        plan: dict[str, Any] | None = None,
+        plan_path: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_job_id: str | None = job_id
+        resolved_dest: Path | None = Path(dest_dir) if dest_dir and str(dest_dir).strip() else None
+        if resolved_dest is None or resolved_job_id is None:
+            try:
+                jid, db_dest = self._resolve_job_and_dest(resolved_job_id)
+                if resolved_job_id is None:
+                    resolved_job_id = jid
+                if resolved_dest is None:
+                    resolved_dest = db_dest
+            except _ApiError:
+                if resolved_dest is None:
+                    raise
+        try:
+            return refine_exported_tree(
+                self.cfg.db_path,
+                resolved_dest,
+                job_id=resolved_job_id,
+                plan_data=plan,
+                plan_path=plan_path,
+            )
+        except FileNotFoundError as exc:
+            raise _ApiError(404, str(exc)) from exc
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise _ApiError(400, str(exc)) from exc
+
     def run_ai_debate(
         self,
         job_id: str | None = None,
@@ -1397,6 +1430,12 @@ if FASTAPI_AVAILABLE:
         plan: dict[str, Any] | None = None
         plan_path: str | None = None
 
+    class TreeRefineRequest(BaseModel):
+        job_id: str | None = None
+        dest_dir: str | None = None
+        plan: dict[str, Any] | None = None
+        plan_path: str | None = None
+
     class AIDebateRequest(BaseModel):
         job_id: str | None = None
         resume: bool = False
@@ -1602,6 +1641,19 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
             return await asyncio.to_thread(
                 core.import_tree_plan,
                 payload.job_id,
+                payload.plan,
+                payload.plan_path,
+            )
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/api/tree/refine")
+    async def refine_tree_post(payload: TreeRefineRequest) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                core.refine_tree,
+                payload.job_id,
+                payload.dest_dir,
                 payload.plan,
                 payload.plan_path,
             )
@@ -1854,6 +1906,16 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                         200,
                         core.import_tree_plan(
                             body.get("job_id"),
+                            body.get("plan"),
+                            body.get("plan_path"),
+                        ),
+                    )
+                elif path == "/api/tree/refine":
+                    self._send_json(
+                        200,
+                        core.refine_tree(
+                            body.get("job_id"),
+                            body.get("dest_dir"),
                             body.get("plan"),
                             body.get("plan_path"),
                         ),
