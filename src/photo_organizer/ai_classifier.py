@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from photo_organizer.config import resolve_cli_binary
+from photo_organizer.config import AGY_ALLOWED_NAMES, is_standard_agy_binary, resolve_cli_binary
 from photo_organizer.db import init_db, open_connection
 
 DEFAULT_AGY_MODEL = "gemini-4-hydrogen-medium"
@@ -46,6 +47,8 @@ def _clean_label(raw: str) -> str:
     """Sanitize an event label and strip template/punctuation artifacts."""
     cleaned = raw.strip().strip("\"'`")
     cleaned = re.sub(r"Fotos_Carpeta__Gps_[^\s]*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:fallback_|placeholder|sample_)[^\s]*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"__+", " ", cleaned)
     cleaned = re.sub(r"[<>:\"/\\|?*]+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned[:60]
@@ -57,9 +60,12 @@ def _parse_agy_output(stdout: str) -> str:
     if not text:
         return ""
 
-    # Strip optional markdown code fences
+    # Strip optional markdown code fences (including unclosed leading fences)
     fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
-    candidate = fence_match.group(1).strip() if fence_match else text
+    if fence_match:
+        candidate = fence_match.group(1).strip()
+    else:
+        candidate = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
 
     # Try direct JSON or embedded JSON object
     json_candidates = [candidate]
@@ -78,7 +84,16 @@ def _parse_agy_output(stdout: str) -> str:
         except json.JSONDecodeError:
             continue
 
+    # If the output looks like truncated/malformed JSON, let the caller fall back cleanly
+    if candidate.startswith(("{", "[")) or re.search(
+        r'"(?:nombre_evento|event_name|nombre|evento|label)"\s*:',
+        candidate,
+    ):
+        return ""
+
     first_line = next((ln.strip() for ln in candidate.splitlines() if ln.strip()), "")
+    if first_line.startswith(("{", "[")):
+        return ""
     return _clean_label(first_line)
 
 
@@ -144,11 +159,17 @@ def classify_with_agy(
     cli_command: str = "agy",
     model: str = DEFAULT_AGY_MODEL,
     timeout: float = 15.0,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Invoke local Antigravity CLI (`agy`) via subprocess with heuristic fallback."""
+    if cancel_event is not None and cancel_event.is_set():
+        return heuristic_classify(prompt_key)
+
     cmd_bin = (cli_command or "agy").strip() or "agy"
-    resolved_bin = resolve_cli_binary(cmd_bin)
-    if resolved_bin is None and subprocess.run is _ORIG_SUBPROCESS_RUN:
+    resolved_bin = resolve_cli_binary(cmd_bin, allowed_names=AGY_ALLOWED_NAMES)
+    if resolved_bin is None and (
+        subprocess.run is _ORIG_SUBPROCESS_RUN or not is_standard_agy_binary(cmd_bin)
+    ):
         return heuristic_classify(prompt_key)
 
     selected_model = (model or DEFAULT_AGY_MODEL).strip() or DEFAULT_AGY_MODEL
@@ -158,18 +179,42 @@ def classify_with_agy(
         "(máximo 3 palabras, sin explicación adicional) para este grupo de fotos: "
         f"{prompt_key}"
     )
+    argv = [resolved_bin or cmd_bin, "-m", selected_model, "-p", prompt]
     try:
-        proc = subprocess.run(
-            [resolved_bin or cmd_bin, "-m", selected_model, "-p", prompt],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        if proc.returncode == 0 and proc.stdout:
-            parsed = _parse_agy_output(proc.stdout)
-            if parsed:
-                return parsed
+        if subprocess.run is not _ORIG_SUBPROCESS_RUN:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                parsed = _parse_agy_output(proc.stdout)
+                if parsed:
+                    return parsed
+        else:
+            proc_p = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + timeout
+            while proc_p.poll() is None:
+                if (cancel_event is not None and cancel_event.is_set()) or time.monotonic() >= deadline:
+                    proc_p.terminate()
+                    try:
+                        proc_p.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        proc_p.kill()
+                    return heuristic_classify(prompt_key)
+                time.sleep(0.05)
+            stdout_data, _ = proc_p.communicate()
+            if proc_p.returncode == 0 and stdout_data:
+                parsed = _parse_agy_output(stdout_data)
+                if parsed:
+                    return parsed
     except (OSError, subprocess.SubprocessError):
         pass
     return heuristic_classify(prompt_key)
@@ -301,6 +346,7 @@ class GeminiClassifier:
         kind: str = "item",
         batch_size: int = 100,
         solo_primer_lote: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Require explicit user confirmation before dispatching a remote AI batch."""
         eff_batch_size = batch_size if batch_size and batch_size > 0 else 100
@@ -335,7 +381,11 @@ class GeminiClassifier:
         ]
 
         results: dict[str, str] = {}
+        cancelled = False
         for b_idx, chunk in enumerate(chunks):
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
             batch_info = batches[b_idx]
             cached_chunk: dict[str, str] = {}
             for k in chunk:
@@ -354,6 +404,9 @@ class GeminiClassifier:
             t0 = time.monotonic()
             errors = 0
             for k in chunk:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
                 try:
                     results[k] = self.classify(k, kind=kind)
                     batch_info["processed_items"] += 1
@@ -365,7 +418,7 @@ class GeminiClassifier:
             batch_info["elapsed_seconds"] = round(time.monotonic() - t0, 3)
             batch_info["status"] = "error" if errors > 0 and batch_info["processed_items"] == 0 else "completado"
 
-            if solo_primer_lote and b_idx == 0 and total_batches > 1:
+            if cancelled or (solo_primer_lote and b_idx == 0 and total_batches > 1):
                 break
 
         return {
@@ -375,6 +428,7 @@ class GeminiClassifier:
             "solo_primer_lote": solo_primer_lote,
             "model": self.model,
             "circuit_open": self.circuit_open,
+            "cancelled": cancelled,
             "batches": batches,
             "results": results,
         }

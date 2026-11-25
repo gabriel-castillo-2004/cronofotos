@@ -22,7 +22,13 @@ from urllib.parse import parse_qs, urlparse
 
 from photo_organizer.ai_classifier import DEFAULT_AGY_MODEL, GeminiClassifier, classify_with_agy
 from photo_organizer.clustering import offline_reverse_geocode
-from photo_organizer.config import OrganizerConfig, resolve_cli_binary, validate_source_dest_pair
+from photo_organizer.config import (
+    AGY_ALLOWED_NAMES,
+    OrganizerConfig,
+    is_standard_agy_binary,
+    resolve_cli_binary,
+    validate_source_dest_pair,
+)
 from photo_organizer.db import init_db, open_connection, recompute_filenames
 from photo_organizer.exporter import run_two_phase_export
 from photo_organizer.media import BinaryHealthCheck, MediaMetadataService
@@ -90,6 +96,7 @@ class _LocalAppCore:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._loop_lock = threading.Lock()
+        self._ai_cancel_event = threading.Event()
 
     def _ensure_bg_loop(self) -> asyncio.AbstractEventLoop:
         with self._loop_lock:
@@ -112,7 +119,7 @@ class _LocalAppCore:
     def health(self) -> dict[str, Any]:
         status = BinaryHealthCheck.check(self.cfg.exiftool_path, self.cfg.ffmpeg_path)
         agy_cmd = self.state.get("antigravity_cli") or "agy"
-        agy_path = resolve_cli_binary(agy_cmd)
+        agy_path = resolve_cli_binary(agy_cmd, allowed_names=AGY_ALLOWED_NAMES)
         agy_ok = bool(agy_path)
         model = self.state.get("model") or DEFAULT_AGY_MODEL
         return {
@@ -145,8 +152,15 @@ class _LocalAppCore:
         if payload.get("ffmpeg_path") is not None:
             self.cfg.ffmpeg_path = str(payload["ffmpeg_path"]).strip() or None
         cli_cmd = payload.get("antigravity_cli")
+        cli_warning: str | None = None
         if cli_cmd is not None:
-            self.state["antigravity_cli"] = str(cli_cmd).strip() or "agy"
+            cleaned_cli = str(cli_cmd).strip() or "agy"
+            if not is_standard_agy_binary(cleaned_cli):
+                cli_warning = (
+                    "El comando Antigravity CLI difiere del ejecutable estándar 'agy' "
+                    "(agy.exe/.cmd/.bat) y no se ejecutará."
+                )
+            self.state["antigravity_cli"] = cleaned_cli
         model = str(payload.get("model") or payload.get("gemini_model") or "").strip()
         if model:
             self.state["model"] = model
@@ -157,7 +171,10 @@ class _LocalAppCore:
         self.orchestrator.media_service = self.media_service
         self.orchestrator.antigravity_cli = self.state["antigravity_cli"]
         self.orchestrator.ai_model = self.state["model"]
-        return self.get_settings()
+        settings = self.get_settings()
+        if cli_warning:
+            settings["warning"] = cli_warning
+        return settings
 
     def browse_folder(self, initial_dir: str | None = None) -> dict[str, Any]:
         """Open a native folder picker dialog on the local Windows/desktop host."""
@@ -412,6 +429,11 @@ class _LocalAppCore:
             raise _ApiError(404, "Item not found")
         return self.thumbs.get_or_create(row["id"], Path(row["source_path"]), row["sha256"])
 
+    def cancel_ai(self) -> dict[str, Any]:
+        """Signal any in-flight AI classification or folder regeneration to stop."""
+        self._ai_cancel_event.set()
+        return {"cancelled": True}
+
     def ai_classify(
         self,
         item_ids: list[str],
@@ -419,6 +441,8 @@ class _LocalAppCore:
         batch_size: int = 100,
         solo_primer_lote: bool = False,
     ) -> dict[str, Any]:
+        if confirmed:
+            self._ai_cancel_event.clear()
         clf = GeminiClassifier(
             self.cfg.db_path,
             cli_command=self.state["antigravity_cli"],
@@ -429,22 +453,25 @@ class _LocalAppCore:
             confirmed=confirmed,
             batch_size=int(batch_size or 100),
             solo_primer_lote=bool(solo_primer_lote),
+            cancel_event=self._ai_cancel_event,
         )
 
     def regenerate_ai_names(self, job_id: str) -> dict[str, Any]:
         """Invalidate AI name cache and re-run AI folder naming on 01_Recuerdos/ folders."""
+        self._ai_cancel_event.clear()
         conn = open_connection(self.cfg.db_path)
         updated = 0
         total_folders = 0
+        cancelled = False
         cli_cmd = self.state["antigravity_cli"]
         model = self.state["model"]
-        agy_available = bool(resolve_cli_binary(cli_cmd))
+        agy_available = bool(resolve_cli_binary(cli_cmd, allowed_names=AGY_ALLOWED_NAMES))
         try:
             with conn:
                 conn.execute("DELETE FROM ai_cache")
             rows = conn.execute(
                 """
-                SELECT target_folder, COUNT(*) AS cnt, MIN(source_path) AS sample_path,
+                SELECT target_folder, COUNT(*) AS cnt, MIN(source_path) AS first_source_path,
                        AVG(latitude) AS avg_lat, AVG(longitude) AS avg_lon
                 FROM media_items
                 WHERE job_id = ? AND target_folder LIKE '01_Recuerdos/%'
@@ -455,13 +482,16 @@ class _LocalAppCore:
             total_folders = len(rows)
             with conn:
                 for row in rows:
+                    if self._ai_cancel_event.is_set():
+                        cancelled = True
+                        break
                     old_folder = str(row["target_folder"])
                     parts = old_folder.split("/")
                     if len(parts) < 3:
                         continue
                     year_part = parts[1]
                     ym_prefix = parts[2].split(" - ")[0]
-                    orig_parent = Path(str(row["sample_path"])).parent.name
+                    orig_parent = Path(str(row["first_source_path"])).parent.name
                     loc_label = offline_reverse_geocode(row["avg_lat"], row["avg_lon"])
                     gps_txt = (
                         f" | GPS: {loc_label}"
@@ -473,7 +503,11 @@ class _LocalAppCore:
                         summary,
                         cli_command=cli_cmd,
                         model=model,
+                        cancel_event=self._ai_cancel_event,
                     )
+                    if self._ai_cancel_event.is_set():
+                        cancelled = True
+                        break
                     safe_ai = "".join("_" if c in '<>:"/\\|?*' else c for c in ai_name).strip()
                     if not safe_ai:
                         continue
@@ -493,8 +527,9 @@ class _LocalAppCore:
             "updated_folders": updated,
             "total_folders": total_folders,
             "cache_cleared": True,
+            "cancelled": cancelled,
             "engine": engine_name,
-            "ai_engine": "agy" if agy_available else "fallback_local",
+            "ai_engine": "agy" if agy_available else "heuristica_local",
             "model": model,
         }
 
@@ -745,6 +780,10 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
     async def ai_regenerate(payload: AIRegenerateRequest) -> dict[str, Any]:
         return await asyncio.to_thread(core.regenerate_ai_names, payload.job_id)
 
+    @app.post("/api/ai/cancel")
+    async def ai_cancel() -> dict[str, Any]:
+        return core.cancel_ai()
+
     @app.post("/api/export")
     async def export_tree(payload: ExportRequest) -> dict[str, Any]:
         try:
@@ -910,6 +949,8 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                     )
                 elif path == "/api/ai/regenerate":
                     self._send_json(200, core.regenerate_ai_names(body["job_id"]))
+                elif path == "/api/ai/cancel":
+                    self._send_json(200, core.cancel_ai())
                 elif path == "/api/export":
                     self._send_json(
                         200,

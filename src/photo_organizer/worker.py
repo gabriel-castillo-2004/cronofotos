@@ -519,9 +519,9 @@ class PipelineOrchestrator:
                     continue
                 year_part = parts[1]
                 ym_prefix = parts[2].split(" - ")[0]
-                sample = group_items[0]
-                orig_parent = Path(sample.source_path).parent.name
-                loc_label = offline_reverse_geocode(sample.latitude, sample.longitude)
+                first_item = group_items[0]
+                orig_parent = Path(first_item.source_path).parent.name
+                loc_label = offline_reverse_geocode(first_item.latitude, first_item.longitude)
                 gps_txt = (
                     f" | GPS: {loc_label}"
                     if loc_label and not loc_label.startswith("GPS ")

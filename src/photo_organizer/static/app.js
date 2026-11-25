@@ -493,34 +493,53 @@ function bindEvents() {
 
   $("settings-form").onsubmit = async (e) => {
     e.preventDefault();
-    await api("/api/settings", "POST", {
+    const res = await api("/api/settings", "POST", {
       exiftool_path: $("cfg-exiftool").value,
       ffmpeg_path: $("cfg-ffmpeg").value,
       antigravity_cli: $("cfg-antigravity-cli").value,
       model: $("cfg-antigravity-model").value,
     });
     $("settings-modal").close();
+    if (res && res.warning) {
+      showToast(res.warning, "warn");
+      logActivity(res.warning);
+    }
     await refreshHealth();
   };
+
+  if ($("btn-ai-cancel-run")) {
+    $("btn-ai-cancel-run").onclick = async () => {
+      try {
+        await api("/api/ai/cancel", "POST", {});
+        logActivity("Cancelando proceso de IA...");
+      } catch (err) {
+        showToast(`No se pudo cancelar IA: ${err.message}`, "warn");
+      }
+    };
+  }
 
   if ($("btn-ai-regenerate")) {
     $("btn-ai-regenerate").onclick = async () => {
       if (!state.jobId) return showToast("Primero ejecuta Organizar Automáticamente.", "warn");
       const restore = setActionBusy("btn-ai-regenerate", "Regenerando nombres con IA...");
+      if ($("btn-ai-cancel-run")) $("btn-ai-cancel-run").classList.remove("hidden");
       $("progress-stage").textContent = "Estado: Regenerando nombres con IA...";
       logActivity("Regenerando nombres de carpetas con IA...");
       try {
         const res = await api("/api/ai/regenerate", "POST", { job_id: state.jobId });
         const engine = res.engine || res.model || "Fallback local";
-        const msg = `Nombres actualizados (${res.updated_folders || 0} carpetas) usando ${engine}.`;
+        const msg = res.cancelled
+          ? `Regeneración cancelada (${res.updated_folders || 0} carpetas actualizadas).`
+          : `Nombres actualizados (${res.updated_folders || 0} carpetas) usando ${engine}.`;
         $("progress-stage").textContent = `Estado: ${msg}`;
-        showToast(msg, "ok");
+        showToast(msg, res.cancelled ? "warn" : "ok");
         logActivity(msg);
         await loadTree();
       } catch (err) {
         showToast(`Error al regenerar nombres: ${err.message}`, "warn");
         logActivity(`Error al regenerar nombres: ${err.message}`);
       } finally {
+        if ($("btn-ai-cancel-run")) $("btn-ai-cancel-run").classList.add("hidden");
         restore();
       }
     };
@@ -544,22 +563,41 @@ function bindEvents() {
     };
   }
 
-  $("btn-ai-cancel").onclick = () => $("ai-confirm-modal").close();
-  $("btn-ai-confirm").onclick = async () => {
-    const ids = state.items.map((it) => it.id);
-    const { batch_size, solo_primer_lote } = getBatchOptions();
-    const res = await api("/api/ai/classify", "POST", {
-      job_id: state.jobId,
-      item_ids: ids,
-      confirmed: true,
-      batch_size,
-      solo_primer_lote,
-    });
-    $("ai-confirm-modal").close();
-    if (Array.isArray(res.batches)) {
-      renderBatches(res.batches);
+  $("btn-ai-cancel").onclick = async () => {
+    try {
+      await api("/api/ai/cancel", "POST", {});
+    } catch {
+      // ignore if idle
     }
-    await loadTree();
+    $("ai-confirm-modal").close();
+  };
+  $("btn-ai-confirm").onclick = async () => {
+    const btn = $("btn-ai-confirm");
+    const originalHtml = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner" aria-hidden="true"></span> Clasificando...';
+    try {
+      const ids = state.items.map((it) => it.id);
+      const { batch_size, solo_primer_lote } = getBatchOptions();
+      const res = await api("/api/ai/classify", "POST", {
+        job_id: state.jobId,
+        item_ids: ids,
+        confirmed: true,
+        batch_size,
+        solo_primer_lote,
+      });
+      $("ai-confirm-modal").close();
+      if (Array.isArray(res.batches)) {
+        renderBatches(res.batches);
+      }
+      await loadTree();
+    } catch (err) {
+      showToast(`Error al clasificar con IA: ${err.message}`, "warn");
+      logActivity(`Error al clasificar con IA: ${err.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+    }
   };
 
   $("btn-export").onclick = async () => {
@@ -578,7 +616,7 @@ function bindEvents() {
       if (Array.isArray(res.batches)) {
         renderBatches(res.batches);
       }
-      const msg = `Exportación completa: ${res.exported} exportados, ${res.duplicates} duplicados, ${res.skipped} omitidos.`;
+      const msg = `Exportación completa: ${res.exported} exportados, ${res.sidecars_merged || 0} con sidecar .json, ${res.duplicates} duplicados, ${res.skipped} omitidos.`;
       $("progress-stage").textContent = `Estado: ${msg}`;
       showToast(msg, "ok");
       logActivity(msg);

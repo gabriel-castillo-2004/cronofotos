@@ -54,13 +54,14 @@ def run_two_phase_export(
     duplicates = 0
     skipped = 0
     failed = 0
+    sidecars_merged = 0
     batches_info: list[dict[str, Any]] = []
 
     try:
         rows = conn.execute(
             """
             SELECT id, source_path, ext, sha256, is_duplicate, is_placeholder,
-                   target_folder, target_filename, metadata_json, export_state, route_reason
+                   sidecar_path, target_folder, target_filename, metadata_json, export_state, route_reason
             FROM media_items
             WHERE job_id = ?
             ORDER BY target_folder ASC, target_filename ASC
@@ -201,6 +202,8 @@ def run_two_phase_export(
                 exported += 1
                 batch_exported += 1
                 batch_info["processed_items"] += 1
+                if row["sidecar_path"]:
+                    sidecars_merged += 1
                 if row["is_duplicate"]:
                     duplicates += 1
                     batch_info["duplicates_skipped"] += 1
@@ -229,6 +232,7 @@ def run_two_phase_export(
         "duplicates": duplicates,
         "skipped": skipped,
         "failed": failed,
+        "sidecars_merged": sidecars_merged,
         "cleaned_tmp": cleaned,
         "batch_size": eff_batch_size,
         "solo_primer_lote": solo_primer_lote,

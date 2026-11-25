@@ -136,6 +136,17 @@ def is_onedrive_placeholder(
     return is_reparse and is_cloud
 
 
+AGY_ALLOWED_NAMES: frozenset[str] = frozenset({"agy", "agy.exe", "agy.cmd", "agy.bat"})
+
+
+def is_standard_agy_binary(command: str | None) -> bool:
+    """Return True if the command basename matches the standard Antigravity CLI executable."""
+    raw = (command or "").strip()
+    if not raw:
+        return False
+    return Path(raw).name.lower() in AGY_ALLOWED_NAMES
+
+
 def _safe_which(name: str, search_path: str | None = None) -> str | None:
     """Resolve binary via shutil.which while tolerating 1-arg test monkeypatches."""
     if search_path is None:
@@ -146,25 +157,36 @@ def _safe_which(name: str, search_path: str | None = None) -> str | None:
         return shutil.which(name)
 
 
-def resolve_cli_binary(binary: str | None, custom_path: str | None = None) -> str | None:
+def resolve_cli_binary(
+    binary: str | None,
+    custom_path: str | None = None,
+    *,
+    allowed_names: frozenset[str] | None = None,
+) -> str | None:
     """Resolve optional CLI executable path via custom path or shutil.which without raising."""
+
+    def _is_allowed(resolved: str) -> bool:
+        if allowed_names is None:
+            return True
+        return Path(resolved).name.lower() in allowed_names
+
     if custom_path:
         custom_candidate = Path(str(custom_path).strip())
-        if custom_candidate.is_file():
+        if custom_candidate.is_file() and _is_allowed(str(custom_candidate)):
             return str(custom_candidate)
     raw = (binary or "").strip()
     if not raw:
         return None
     candidate = Path(raw)
     if (os.sep in raw or (os.altsep is not None and os.altsep in raw)) and candidate.is_file():
-        return str(candidate)
+        return str(candidate) if _is_allowed(str(candidate)) else None
 
     found = _safe_which(raw)
-    if found:
+    if found and _is_allowed(found):
         return found
     if os.name == "nt" and not raw.lower().endswith(".exe"):
         found_exe = _safe_which(f"{raw}.exe")
-        if found_exe:
+        if found_exe and _is_allowed(found_exe):
             return found_exe
     return None
 
