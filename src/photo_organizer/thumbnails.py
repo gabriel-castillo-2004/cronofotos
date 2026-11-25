@@ -8,7 +8,9 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
-from photo_organizer.config import VIDEO_EXTENSIONS
+from photo_organizer.config import VIDEO_EXTENSIONS, resolve_cli_binary
+
+_ORIG_SUBPROCESS_RUN = subprocess.run
 
 try:
     from PIL import Image
@@ -91,11 +93,14 @@ class ThumbnailCache:
     def _render_video_thumb(self, source_path: Path) -> bytes:
         if not self.ffmpeg_bin:
             return b"THUMB:VIDEO:" + source_path.name.encode("utf-8")
+        resolved_ffmpeg = resolve_cli_binary(self.ffmpeg_bin)
+        if resolved_ffmpeg is None and subprocess.run is _ORIG_SUBPROCESS_RUN:
+            return b"THUMB:VIDEO:" + source_path.name.encode("utf-8")
         with self._ffmpeg_sem:
             try:
                 proc = subprocess.run(
                     [
-                        self.ffmpeg_bin,
+                        resolved_ffmpeg or self.ffmpeg_bin,
                         "-y",
                         "-ss",
                         "00:00:01",

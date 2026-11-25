@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -12,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from photo_organizer.config import VIDEO_EXTENSIONS
+from photo_organizer.config import VIDEO_EXTENSIONS, resolve_cli_binary
 
 try:  # Optional Pillow / pillow-heif / piexif support
     from PIL import ExifTags, Image
@@ -49,18 +48,7 @@ class BinaryHealthCheck:
 
     @staticmethod
     def resolve_binary(name: str, custom_path: str | None = None) -> str | None:
-        if custom_path:
-            p = Path(custom_path)
-            if p.is_file():
-                return str(p)
-        found = shutil.which(name)
-        if found:
-            return found
-        if os.name == "nt" and not name.endswith(".exe"):
-            found_exe = shutil.which(f"{name}.exe")
-            if found_exe:
-                return found_exe
-        return None
+        return resolve_cli_binary(name, custom_path)
 
     @classmethod
     def check(
@@ -102,8 +90,11 @@ class ExifToolProcess:
                 return self._proc
             self.close()
 
+        resolved_bin = resolve_cli_binary(self.binary_path)
+        if not resolved_bin:
+            raise FileNotFoundError(f"ExifTool executable not found: {self.binary_path}")
         self._proc = subprocess.Popen(
-            [self.binary_path, "-stay_open", "True", "-@", "-"],
+            [resolved_bin, "-stay_open", "True", "-@", "-"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -278,6 +269,8 @@ class MediaMetadataService:
                     "make": raw.get("Make"),
                     "model": raw.get("Model"),
                 }
+            except FileNotFoundError:
+                self.exiftool_bin = None
             except Exception:
                 pass
         return _read_metadata_python_fallback(path)
@@ -313,6 +306,8 @@ class MediaMetadataService:
             try:
                 self._get_exiftool().execute(*args)
                 return True
+            except FileNotFoundError:
+                self.exiftool_bin = None
             except Exception:
                 return False
 

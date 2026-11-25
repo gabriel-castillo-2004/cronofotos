@@ -153,3 +153,60 @@ def test_mod_04_startup_empty_state_and_browse_buttons() -> None:
     # Backend exposes a folder browse endpoint wired from app.js
     assert re.search(r"/api/.*(browse|folder|dialog)", main_py)
     assert re.search(r"/api/.*(browse|folder|dialog)", js)
+
+
+def test_mod_05_cli_resolution_and_missing_binary_fallbacks_without_file_not_found(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """External CLIs (agy, ffmpeg, exiftool) resolve via shutil.which and trigger fallbacks when absent without raising FileNotFoundError."""
+    import os
+    import shutil
+    import subprocess
+
+    from photo_organizer import ai_classifier
+    from photo_organizer.media import MediaMetadataService
+    from photo_organizer.thumbnails import ThumbnailCache
+
+    # 1. agy resolved via shutil.which passes full shim path to subprocess.run
+    shim = tmp_path / ("agy.cmd" if os.name == "nt" else "agy")
+    shim.write_text("@echo off\n" if os.name == "nt" else "#!/bin/sh\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def fake_run_capture(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="Playa_2024\n", stderr="")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(shutil, "which", lambda b, **_kw: str(shim) if b == "agy" else None)
+        mp.setattr(subprocess, "run", fake_run_capture)
+        out = ai_classifier.classify_with_agy("beach", cli_command="agy")
+        assert out == "Playa_2024"
+        assert calls and calls[0][0] == str(shim)
+
+    # 1b. Missing agy without monkeypatching subprocess.run falls back without FileNotFoundError
+    monkeypatch.setattr(shutil, "which", lambda _b, **_kw: None)
+    fb_direct = ai_classifier.classify_with_agy("beach/foto_01.jpg", cli_command="agy")
+    assert fb_direct == "Viaje"
+
+    # 2. Missing exiftool triggers fallback cleanly even if constructed with bare "exiftool"
+    monkeypatch.setattr(shutil, "which", lambda _b, **_kw: None)
+    sample_jpg = tmp_path / "photo.jpg"
+    sample_jpg.write_bytes(b"not-a-real-jpg")
+    svc = MediaMetadataService.__new__(MediaMetadataService)
+    svc.exiftool_bin = "exiftool"
+    svc.ffmpeg_bin = "ffmpeg"
+    svc.timeout_sec = 2.0
+    svc._local = __import__("threading").local()
+    svc._lock = __import__("threading").Lock()
+    svc._processes = []
+    meta = svc.read_metadata(sample_jpg)
+    assert isinstance(meta, dict)
+    assert meta.get("Extractor") == "pillow_piexif_fallback"
+
+    # 3. ThumbnailCache with bare missing ffmpeg_bin returns video fallback without FileNotFoundError
+    fake_mp4 = tmp_path / "clip.mp4"
+    fake_mp4.write_bytes(b"0000")
+    tcache = ThumbnailCache(tmp_path / "thumbs", ffmpeg_bin="ffmpeg")
+    thumb_bytes = tcache.get_or_create("vid1", fake_mp4, "deadbeef")
+    assert thumb_bytes.startswith(b"THUMB:VIDEO:")

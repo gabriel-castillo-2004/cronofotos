@@ -20,7 +20,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from photo_organizer.ai_classifier import DEFAULT_AGY_MODEL, GeminiClassifier
-from photo_organizer.config import OrganizerConfig, validate_source_dest_pair
+from photo_organizer.config import OrganizerConfig, resolve_cli_binary, validate_source_dest_pair
 from photo_organizer.db import init_db, open_connection, recompute_filenames
 from photo_organizer.exporter import run_two_phase_export
 from photo_organizer.media import BinaryHealthCheck, MediaMetadataService
@@ -164,6 +164,9 @@ class _LocalAppCore:
 
         if os.name == "nt":
             try:
+                ps_bin = resolve_cli_binary("powershell")
+                if not ps_bin:
+                    return {"path": "", "cancelled": True, "error": "powershell binary missing"}
                 ps_script = (
                     "Add-Type -AssemblyName System.Windows.Forms; "
                     "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
@@ -172,7 +175,7 @@ class _LocalAppCore:
                     "{ Write-Output $d.SelectedPath }"
                 )
                 proc = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", ps_script],
+                    [ps_bin, "-NoProfile", "-Command", ps_script],
                     capture_output=True,
                     text=True,
                     timeout=120,
