@@ -60,6 +60,7 @@
           <span class="counter-chip">Nuevas: <strong id="cnt-new">0</strong></span>
           <span class="counter-chip">Duplicadas omitidas: <strong id="cnt-dups">0</strong></span>
           <span class="counter-chip">Capturas separadas: <strong id="cnt-screenshots">0</strong></span>
+          <span id="cnt-placeholders-chip" class="counter-chip hidden">Solo en la nube (OneDrive): <strong id="cnt-placeholders">0</strong></span>
         </div>
       </div>
 
@@ -148,7 +149,10 @@
 
       <section class="items-pane" role="region" aria-label="Elementos de la carpeta">
         <div class="pane-header">
-          <h2 id="current-folder-title">Elementos</h2>
+          <div class="items-title-group">
+            <h2 id="current-folder-title">Elementos</h2>
+            <button id="btn-clear-folder-filter" type="button" class="btn small hidden">× Ver todos</button>
+          </div>
           <div class="pagination">
             <button id="btn-prev-page" type="button" class="btn small">Anterior</button>
             <span id="page-info" aria-live="polite">Página 1</span>

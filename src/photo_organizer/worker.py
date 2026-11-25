@@ -132,6 +132,7 @@ class ProgressSnapshot:
     duplicates_count: int = 0
     screenshots_count: int = 0
     manual_review_count: int = 0
+    placeholders_count: int = 0
     items_per_sec: float = 0.0
     batch_size: int = DEFAULT_BATCH_SIZE
     solo_primer_lote: bool = False
@@ -150,6 +151,7 @@ class ProgressSnapshot:
             "duplicates_count": self.duplicates_count,
             "screenshots_count": self.screenshots_count,
             "manual_review_count": self.manual_review_count,
+            "placeholders_count": self.placeholders_count,
             "items_per_sec": round(self.items_per_sec, 2),
             "batch_size": self.batch_size,
             "solo_primer_lote": self.solo_primer_lote,
@@ -278,6 +280,7 @@ class PipelineOrchestrator:
                 item_id = uuid.uuid4().hex
                 ext = fpath.suffix.lower()
                 if is_onedrive_placeholder(fpath):
+                    self._current_snapshot.placeholders_count += 1
                     discovered.append(
                         _DiscoveredMedia(
                             item_id=item_id,

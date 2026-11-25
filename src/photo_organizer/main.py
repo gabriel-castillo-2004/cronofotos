@@ -25,6 +25,7 @@ from photo_organizer.ai_classifier import (
     DEFAULT_AGY_MODEL,
     GeminiClassifier,
     classify_with_agy,
+    generate_tree_ai_suggestions,
     suggest_tree_optimizations,
 )
 from photo_organizer.clustering import offline_reverse_geocode
@@ -33,6 +34,7 @@ from photo_organizer.config import (
     VIDEO_EXTENSIONS,
     OrganizerConfig,
     is_standard_agy_binary,
+    normalize_win_path,
     resolve_cli_binary,
     validate_source_dest_pair,
 )
@@ -569,6 +571,7 @@ class _LocalAppCore:
             by_folder.setdefault(str(r["target_folder"]), []).append(r)
 
         folder_summaries: list[dict[str, Any]] = []
+        folder_to_rep_id: dict[str, str] = {}
         for folder, items in by_folder.items():
             mid = len(items) // 2
             rep = items[mid]
@@ -577,8 +580,10 @@ class _LocalAppCore:
                 if 0 <= cand_idx < len(items) and str(items[cand_idx]["ext"]).lower() not in VIDEO_EXTENSIONS:
                     rep = items[cand_idx]
                     break
+            rep_id = str(rep["id"])
+            folder_to_rep_id[folder] = rep_id
             thumb_path = self.thumbs.get_or_create_resized(
-                str(rep["id"]),
+                rep_id,
                 Path(str(rep["source_path"])),
                 sha256=rep["sha256"],
                 max_dim=256,
@@ -602,6 +607,12 @@ class _LocalAppCore:
                 if gap > max_gap:
                     max_gap = gap
 
+            is_midnight_merged = (
+                len(parsed_dts) >= 2
+                and parsed_dts[0].date() != parsed_dts[-1].date()
+                and (parsed_dts[-1] - parsed_dts[0]).total_seconds() <= 14 * 3600
+            )
+
             folder_summaries.append(
                 {
                     "folder": folder,
@@ -610,6 +621,7 @@ class _LocalAppCore:
                     "end_date": parsed_dts[-1].isoformat() if parsed_dts else None,
                     "location_label": loc_label,
                     "max_gap_hours": round(max_gap, 2),
+                    "is_midnight_merged": is_midnight_merged,
                     "thumb_path": str(thumb_path),
                 }
             )
@@ -618,12 +630,23 @@ class _LocalAppCore:
             folder_summaries,
             cli_command=self.state["antigravity_cli"],
             model=self.state["model"],
+            timeout=60.0,
             cancel_event=self._ai_cancel_event,
         )
+        enriched: list[dict[str, Any]] = []
+        for s in res["suggestions"]:
+            item = dict(s)
+            before = item.get("before")
+            rep_key = before[0] if isinstance(before, list) and before else before
+            rid = folder_to_rep_id.get(str(rep_key or ""))
+            if rid:
+                item["thumb_item_id"] = rid
+                item["thumb_url"] = f"/api/thumbnails/{rid}"
+            enriched.append(item)
         return {
             "job_id": jid,
             "engine": res["engine"],
-            "suggestions": res["suggestions"],
+            "suggestions": enriched,
         }
 
     def apply_ai_tree_suggestions(
@@ -754,6 +777,38 @@ class _LocalAppCore:
         else:
             subprocess.Popen(["xdg-open", str(dest_path)])
         return {"opened": True, "path": str(dest_path)}
+
+    def open_system_folder(self, job_id: str | None = None, path: str | None = None) -> dict[str, Any]:
+        """Open the configured destination folder (or a subpath inside it) in the OS file explorer."""
+        conn = open_connection(self.cfg.db_path)
+        try:
+            if job_id:
+                row = conn.execute("SELECT dest_dir FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            else:
+                row = conn.execute("SELECT dest_dir FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        if not row or not row["dest_dir"]:
+            raise _ApiError(404, "No hay Carpeta Destino configurada para este trabajo")
+
+        allowed_dest = normalize_win_path(str(row["dest_dir"]))
+        requested = (path or "").strip()
+        target_path = normalize_win_path(requested) if requested else allowed_dest
+
+        allowed_cmp = Path(os.path.normcase(str(allowed_dest)))
+        target_cmp = Path(os.path.normcase(str(target_path)))
+        if target_cmp != allowed_cmp and allowed_cmp not in target_cmp.parents:
+            raise _ApiError(403, "Solo se permite abrir la Carpeta Destino configurada")
+
+        if not target_path.exists():
+            raise _ApiError(404, "Destination directory does not exist")
+        if os.name == "nt":
+            os.startfile(str(target_path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(target_path)])
+        else:
+            subprocess.Popen(["xdg-open", str(target_path)])
+        return {"opened": True, "path": str(target_path)}
 
     def export_tree(
         self,
@@ -1016,6 +1071,13 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
         except _ApiError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
+    @app.post("/api/system/open-folder")
+    async def open_system_folder(payload: OpenDestinationRequest) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(core.open_system_folder, payload.job_id, payload.path)
+        except _ApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -1197,6 +1259,11 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                     self._send_json(
                         200,
                         core.open_destination(body.get("job_id"), body.get("path")),
+                    )
+                elif path == "/api/system/open-folder":
+                    self._send_json(
+                        200,
+                        core.open_system_folder(body.get("job_id"), body.get("path")),
                     )
                 else:
                     self._send_json(404, {"detail": "Not found"})
