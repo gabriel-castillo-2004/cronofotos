@@ -71,11 +71,21 @@
             <button id="btn-browse-dest" type="button" class="btn secondary">Examinar...</button>
           </div>
         </label>
+        <label>
+          Índice maestro previo (_cronofotos_index.json)
+          <div class="input-with-btn">
+            <input id="master-index-path" type="text" placeholder="Opcional: ruta a _cronofotos_index.json o master_index.json" />
+          </div>
+        </label>
         <div class="autopilot-cta">
           <button id="btn-start" type="button" class="btn primary btn-autopilot">Organizar Automáticamente</button>
           <label class="checkbox-label discreet-check">
             <input id="solo-primer-lote" type="checkbox" />
             <span>Modo prueba (100 archivos)</span>
+          </label>
+          <label class="checkbox-label discreet-check">
+            <input id="incremental-mode" type="checkbox" />
+            <span>Modo incremental (exportar solo archivos nuevos)</span>
           </label>
         </div>
       </div>

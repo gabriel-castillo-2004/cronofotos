@@ -13,7 +13,18 @@ from typing import Any, Callable
 from photo_organizer.config import IGNORED_SIDECAR_EXTENSIONS, to_win_long_path
 from photo_organizer.db import open_connection
 from photo_organizer.media import MediaMetadataService
-from photo_organizer.worker import compute_sha256_streaming, load_library_index, save_library_index
+from photo_organizer.worker import (
+    MASTER_INDEX_FILENAME,
+    compute_sha256_streaming,
+    load_index_file,
+    load_library_index,
+    save_index_file,
+    save_library_index,
+)
+
+OMITTED_ROUTE_REASONS: frozenset[str] = frozenset(
+    {"already_in_library", "ya respaldado en índice maestro"}
+)
 
 
 def cleanup_orphaned_tmp_files(dest_dir: Path) -> int:
@@ -40,6 +51,8 @@ def run_two_phase_export(
     crash_after: int | None = None,
     batch_size: int = 100,
     solo_primer_lote: bool = False,
+    incremental_mode: bool = False,
+    master_index_path: str | Path | None = None,
     pause_event: threading.Event | None = None,
     on_batch_progress: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> dict[str, Any]:
@@ -95,7 +108,8 @@ def run_two_phase_export(
             # Skip already completed batches when resuming/continuing
             if all(
                 r["export_state"] == "VERIFIED"
-                or r["route_reason"] == "already_in_library"
+                or r["route_reason"] in OMITTED_ROUTE_REASONS
+                or (incremental_mode and bool(r["is_duplicate"]))
                 or r["is_placeholder"]
                 or str(r["ext"]).lower() in IGNORED_SIDECAR_EXTENSIONS
                 for r in chunk
@@ -118,7 +132,11 @@ def run_two_phase_export(
                 if pause_event is not None:
                     pause_event.wait()
 
-                if row["export_state"] == "VERIFIED" or row["route_reason"] == "already_in_library":
+                if (
+                    row["export_state"] == "VERIFIED"
+                    or row["route_reason"] in OMITTED_ROUTE_REASONS
+                    or (incremental_mode and bool(row["is_duplicate"]))
+                ):
                     skipped += 1
                     batch_info["processed_items"] += 1
                     continue
@@ -145,7 +163,10 @@ def run_two_phase_export(
                     batch_info["processed_items"] += 1
                     continue
 
-                target_dir = dest_dir / row["target_folder"]
+                effective_target_folder = str(row["target_folder"])
+                if incremental_mode and effective_target_folder.startswith("01_Recuerdos/"):
+                    effective_target_folder = effective_target_folder[len("01_Recuerdos/") :]
+                target_dir = dest_dir / effective_target_folder
                 target_dir.mkdir(parents=True, exist_ok=True)
                 final_path = target_dir / row["target_filename"]
                 tmp_path = target_dir / f"{row['target_filename']}.tmp"
@@ -212,7 +233,7 @@ def run_two_phase_export(
                     batch_info["duplicates_skipped"] += 1
                 else:
                     lib_index[expected_sha] = {
-                        "rel_path": f"{row['target_folder']}/{row['target_filename']}",
+                        "rel_path": f"{effective_target_folder}/{row['target_filename']}",
                         "size_bytes": file_size,
                     }
 
@@ -227,6 +248,17 @@ def run_two_phase_export(
         conn.close()
         try:
             save_library_index(dest_dir, lib_index)
+        except OSError:
+            pass
+        try:
+            master_path = db_path.parent / MASTER_INDEX_FILENAME
+            master_index = load_index_file(master_path)
+            if master_index_path:
+                custom_p = Path(str(master_index_path).strip())
+                if custom_p.is_file():
+                    master_index.update(load_index_file(custom_p))
+            master_index.update(lib_index)
+            save_index_file(master_path, master_index)
         except OSError:
             pass
 

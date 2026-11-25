@@ -28,6 +28,7 @@ from photo_organizer.sidecar import build_json_index, merge_metadata, resolve_si
 
 
 INDEX_FILENAME = "_cronofotos_index.json"
+MASTER_INDEX_FILENAME = "master_index.json"
 VALID_BATCH_SIZES = (50, 100, 250, 500)
 DEFAULT_BATCH_SIZE = 100
 
@@ -49,13 +50,60 @@ def compute_sha256_streaming(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def save_library_index(dest_dir: Path, index: dict[str, dict[str, Any]]) -> None:
-    """Persist _cronofotos_index.json atomically inside dest_dir."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    index_path = dest_dir / INDEX_FILENAME
-    tmp_path = dest_dir / f"{INDEX_FILENAME}.tmp"
+def save_index_file(index_path: Path, index: dict[str, dict[str, Any]]) -> None:
+    """Persist a JSON index file atomically."""
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = index_path.parent / f"{index_path.name}.tmp"
     tmp_path.write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp_path, index_path)
+
+
+def load_index_file(index_path: Path) -> dict[str, dict[str, Any]]:
+    """Load a JSON index file safely, returning an empty dict if missing or invalid."""
+    if not index_path.is_file():
+        return {}
+    try:
+        loaded = json.loads(index_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            return {
+                str(k): v
+                for k, v in loaded.items()
+                if isinstance(v, dict)
+            }
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_library_index(dest_dir: Path, index: dict[str, dict[str, Any]]) -> None:
+    """Persist _cronofotos_index.json atomically inside dest_dir."""
+    save_index_file(dest_dir / INDEX_FILENAME, index)
+
+
+def load_master_index(
+    dest_dir: Path,
+    data_dir: Path,
+    custom_index_path: str | Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Load and merge historical SHA-256 indexes from dest_dir, data_dir, and optional custom path."""
+    merged: dict[str, dict[str, Any]] = {}
+    master_file = data_dir / MASTER_INDEX_FILENAME
+    merged.update(load_index_file(master_file))
+
+    if custom_index_path:
+        raw = str(custom_index_path).strip()
+        if raw:
+            cand = Path(raw)
+            if cand.is_dir():
+                for name in (INDEX_FILENAME, MASTER_INDEX_FILENAME):
+                    if (cand / name).is_file():
+                        merged.update(load_index_file(cand / name))
+            elif cand.is_file():
+                merged.update(load_index_file(cand))
+
+    if dest_dir.exists():
+        merged.update(load_library_index(dest_dir))
+    return merged
 
 
 def load_library_index(dest_dir: Path) -> dict[str, dict[str, Any]]:
@@ -218,6 +266,8 @@ class PipelineOrchestrator:
         gps_distance_km: float = 25.0,
         batch_size: int = DEFAULT_BATCH_SIZE,
         solo_primer_lote: bool = False,
+        incremental_mode: bool = False,
+        master_index_path: str | Path | None = None,
     ) -> str:
         """Execute or resume a scan+stage job with global size+SHA-256 dedup and batching."""
         src, dst = validate_source_dest_pair(source_dir, dest_dir)
@@ -265,13 +315,21 @@ class PipelineOrchestrator:
             self._current_snapshot.phase_label = "1/4 Depurando duplicados"
             self._emit(force=True)
 
-            dest_index = load_library_index(dst)
+            use_master_index = bool(incremental_mode or (master_index_path and str(master_index_path).strip()))
+            if use_master_index:
+                dest_index = load_master_index(dst, self.db_path.parent, master_index_path)
+            else:
+                dest_index = load_library_index(dst)
             existing_dest_hashes = set(dest_index.keys())
             existing_dest_sizes = {
                 int(v.get("size_bytes", -1))
                 for v in dest_index.values()
-                if isinstance(v, dict)
+                if isinstance(v, dict) and v.get("size_bytes") is not None
             }
+            has_unknown_index_size = any(
+                not isinstance(v, dict) or v.get("size_bytes") is None
+                for v in dest_index.values()
+            )
 
             discovered: list[_DiscoveredMedia] = []
             size_groups: dict[int, list[_DiscoveredMedia]] = {}
@@ -312,9 +370,9 @@ class PipelineOrchestrator:
             global_duplicates = 0
 
             with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-                # Hash files that share a file size with another source file OR with destination library
+                # Hash files that share a file size with another source file OR with destination/master library
                 for sz, group in size_groups.items():
-                    if len(group) <= 1 and sz not in existing_dest_sizes:
+                    if len(group) <= 1 and sz not in existing_dest_sizes and not has_unknown_index_size:
                         continue
                     for entry in group:
                         await self._pause_event.wait()
@@ -410,13 +468,18 @@ class PipelineOrchestrator:
                             else None
                         )
                         if entry.already_in_dest:
+                            omitted_reason = (
+                                "ya respaldado en índice maestro"
+                                if use_master_index
+                                else "already_in_library"
+                            )
                             writer.enqueue(
                                 """
                                 INSERT OR REPLACE INTO media_items
                                     (id, job_id, source_path, ext, size_bytes, sha256, is_duplicate,
                                      captured_at, latitude, longitude, sidecar_path, metadata_json,
                                      target_folder, target_filename, route_reason, export_state)
-                                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, '_Omitidos_Ya_En_Biblioteca', ?, 'already_in_library', 'PENDING_EXPORT')
+                                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, '_Omitidos_Ya_En_Biblioteca', ?, ?, 'PENDING_EXPORT')
                                 """,
                                 (
                                     item_id,
@@ -431,6 +494,7 @@ class PipelineOrchestrator:
                                     sidecar_res.get("sidecar_path"),
                                     json.dumps(merged),
                                     f"omitido_{item_id}{ext}",
+                                    omitted_reason,
                                 ),
                             )
                             processed_total += 1
