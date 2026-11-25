@@ -5,6 +5,9 @@ const state = {
   pageSize: 40,
   totalItems: 0,
   treeItemCount: 0,
+  folders: [],
+  folderFilter: "",
+  collapsedGroups: new Set(),
   items: [],
   sse: null,
   lastLoggedPlaceholders: 0,
@@ -270,6 +273,36 @@ function connectSSE() {
   state.sse = es;
 }
 
+function parseFolderHierarchy(folderPath) {
+  const parts = String(folderPath || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean);
+  if (parts.length >= 3) {
+    return {
+      groupKey: `${parts[0]} · ${parts[1]}`,
+      leafName: parts.slice(2).join(" / "),
+    };
+  }
+  if (parts.length === 2) {
+    if (/^\d{4}$/.test(parts[1])) {
+      return {
+        groupKey: `${parts[0]} · ${parts[1]}`,
+        leafName: parts[1],
+      };
+    }
+    return {
+      groupKey: parts[0],
+      leafName: parts[1],
+    };
+  }
+  const single = parts[0] || String(folderPath || "General");
+  return {
+    groupKey: single,
+    leafName: single,
+  };
+}
+
 async function loadTree() {
   const params = new URLSearchParams({
     page: String(state.page),
@@ -281,124 +314,204 @@ async function loadTree() {
   const data = await api(`/api/tree?${params.toString()}`);
   state.totalItems = data.total || 0;
   state.items = data.items || [];
-  const folderItemSum = (data.folders || []).reduce((acc, f) => acc + Number(f.count || 0), 0);
+  state.folders = data.folders || [];
+  const folderItemSum = state.folders.reduce((acc, f) => acc + Number(f.count || 0), 0);
   state.treeItemCount = Math.max(state.totalItems, folderItemSum);
   updateExportButtonState();
 
-  const folderList = $("folder-list");
-  folderList.innerHTML = "";
-  for (const f of data.folders || []) {
-    const li = document.createElement("li");
-    const isActive = state.selectedFolder === f.folder;
-    li.className = `folder-item ${isActive ? "active" : ""}`;
-    li.dataset.folder = f.folder;
-    li.setAttribute("role", "treeitem");
-    li.setAttribute("aria-selected", isActive ? "true" : "false");
-    li.tabIndex = 0;
+  const renderFolderTree = () => {
+    const folderList = $("folder-list");
+    if (!folderList) return;
+    folderList.innerHTML = "";
 
-    const labelSpan = document.createElement("span");
-    labelSpan.className = "folder-label";
-    labelSpan.textContent = `${f.folder} (${f.count})`;
+    const query = (state.folderFilter || "").trim().toLowerCase();
+    const filtered = (state.folders || []).filter((f) =>
+      !query || String(f.folder || "").toLowerCase().includes(query)
+    );
 
-    const renameBtn = document.createElement("button");
-    renameBtn.type = "button";
-    renameBtn.className = "btn-inline-rename";
-    renameBtn.title = "Renombrar carpeta";
-    renameBtn.setAttribute("aria-label", `Renombrar ${f.folder}`);
-    renameBtn.textContent = "✏️";
+    if (filtered.length === 0 && (state.folders || []).length > 0) {
+      const emptyLi = document.createElement("li");
+      emptyLi.className = "muted";
+      emptyLi.style.padding = "0.5rem";
+      emptyLi.textContent = "Sin carpetas que coincidan con el filtro.";
+      folderList.appendChild(emptyLi);
+      return;
+    }
 
-    const selectFolder = () => {
-      state.selectedFolder = f.folder;
-      state.page = 1;
-      loadTree();
-    };
-
-    renameBtn.onclick = (e) => {
-      e.stopPropagation();
-      if (!state.jobId || li.querySelector(".inline-rename-input")) return;
-      const input = document.createElement("input");
-      input.type = "text";
-      input.className = "inline-rename-input";
-      input.value = f.folder;
-      input.setAttribute("aria-label", `Nuevo nombre para ${f.folder}`);
-
-      const restoreLabel = () => {
-        if (input.parentNode === li) {
-          li.replaceChild(labelSpan, input);
-        }
-        renameBtn.classList.remove("hidden");
-      };
-
-      let committed = false;
-      const commitRename = async () => {
-        if (committed) return;
-        committed = true;
-        const next = input.value.trim();
-        if (!next || next === f.folder) {
-          restoreLabel();
-          return;
-        }
-        input.disabled = true;
-        try {
-          await api("/api/tree/folders/rename", "POST", {
-            job_id: state.jobId,
-            old_folder: f.folder,
-            new_folder: next,
-          });
-          if (state.selectedFolder === f.folder) {
-            state.selectedFolder = next;
-          }
-          logActivity(`Carpeta renombrada: ${f.folder} -> ${next}`);
-          await loadTree();
-        } catch (err) {
-          showToast(`Error al renombrar carpeta: ${err.message}`, "warn");
-          logActivity(`Error al renombrar carpeta: ${err.message}`);
-          restoreLabel();
-        }
-      };
-
-      input.onclick = (ev) => ev.stopPropagation();
-      input.onkeydown = (ev) => {
-        ev.stopPropagation();
-        if (ev.key === "Enter") {
-          ev.preventDefault();
-          commitRename();
-        } else if (ev.key === "Escape") {
-          ev.preventDefault();
-          committed = true;
-          restoreLabel();
-        }
-      };
-      input.onblur = () => commitRename();
-
-      renameBtn.classList.add("hidden");
-      li.replaceChild(input, labelSpan);
-      input.focus();
-      input.setSelectionRange(input.value.length, input.value.length);
-    };
-
-    li.appendChild(labelSpan);
-    li.appendChild(renameBtn);
-    li.onclick = selectFolder;
-    li.onkeydown = (e) => {
-      if (e.target && e.target.tagName === "INPUT") return;
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        selectFolder();
-      } else if (e.key === "ArrowDown") {
-        e.preventDefault();
-        if (li.nextElementSibling) {
-          li.nextElementSibling.focus();
-        }
-      } else if (e.key === "ArrowUp") {
-        e.preventDefault();
-        if (li.previousElementSibling) {
-          li.previousElementSibling.focus();
-        }
+    const groups = new Map();
+    for (const f of filtered) {
+      const { groupKey, leafName } = parseFolderHierarchy(f.folder);
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, []);
       }
-    };
-    folderList.appendChild(li);
-  }
+      groups.get(groupKey).push({ ...f, leafName });
+    }
+
+    for (const [groupKey, groupItems] of groups.entries()) {
+      const isCollapsed = !query && state.collapsedGroups.has(groupKey);
+      const groupLi = document.createElement("li");
+      groupLi.className = "folder-group";
+
+      const headerBtn = document.createElement("button");
+      headerBtn.type = "button";
+      headerBtn.className = "folder-group-header";
+      headerBtn.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
+
+      const titleWrap = document.createElement("span");
+      titleWrap.className = "folder-group-title";
+      const chevron = document.createElement("span");
+      chevron.className = "folder-group-chevron";
+      chevron.textContent = isCollapsed ? "▸" : "▾";
+      const titleText = document.createElement("span");
+      titleText.textContent = groupKey;
+      titleWrap.append(chevron, titleText);
+
+      const groupTotal = groupItems.reduce((acc, item) => acc + Number(item.count || 0), 0);
+      const groupCount = document.createElement("span");
+      groupCount.className = "folder-count";
+      groupCount.textContent = String(groupTotal);
+
+      headerBtn.append(titleWrap, groupCount);
+
+      const subList = document.createElement("ul");
+      subList.className = `folder-group-items ${isCollapsed ? "collapsed" : ""}`;
+      subList.setAttribute("role", "group");
+
+      headerBtn.onclick = () => {
+        if (state.collapsedGroups.has(groupKey)) {
+          state.collapsedGroups.delete(groupKey);
+        } else {
+          state.collapsedGroups.add(groupKey);
+        }
+        renderFolderTree();
+      };
+
+      for (const f of groupItems) {
+        const li = document.createElement("li");
+        const isActive = state.selectedFolder === f.folder;
+        li.className = `folder-item ${isActive ? "active" : ""}`;
+        li.dataset.folder = f.folder;
+        li.title = f.folder;
+        li.setAttribute("role", "treeitem");
+        li.setAttribute("aria-selected", isActive ? "true" : "false");
+        li.tabIndex = 0;
+
+        const labelSpan = document.createElement("span");
+        labelSpan.className = "folder-label";
+        labelSpan.textContent = f.leafName;
+
+        const countPill = document.createElement("span");
+        countPill.className = "folder-count";
+        countPill.textContent = String(f.count);
+
+        const renameBtn = document.createElement("button");
+        renameBtn.type = "button";
+        renameBtn.className = "btn-inline-rename";
+        renameBtn.title = "Renombrar carpeta";
+        renameBtn.setAttribute("aria-label", `Renombrar ${f.folder}`);
+        renameBtn.textContent = "✏️";
+
+        const selectFolder = () => {
+          state.selectedFolder = f.folder;
+          state.page = 1;
+          loadTree();
+        };
+
+        renameBtn.onclick = (e) => {
+          e.stopPropagation();
+          if (!state.jobId || li.querySelector(".inline-rename-input")) return;
+          const input = document.createElement("input");
+          input.type = "text";
+          input.className = "inline-rename-input";
+          input.value = f.folder;
+          input.setAttribute("aria-label", `Nuevo nombre para ${f.folder}`);
+
+          const restoreLabel = () => {
+            if (input.parentNode === li) {
+              li.replaceChild(labelSpan, input);
+            }
+            countPill.classList.remove("hidden");
+            renameBtn.classList.remove("hidden");
+          };
+
+          let committed = false;
+          const commitRename = async () => {
+            if (committed) return;
+            committed = true;
+            const next = input.value.trim();
+            if (!next || next === f.folder) {
+              restoreLabel();
+              return;
+            }
+            input.disabled = true;
+            try {
+              await api("/api/tree/folders/rename", "POST", {
+                job_id: state.jobId,
+                old_folder: f.folder,
+                new_folder: next,
+              });
+              if (state.selectedFolder === f.folder) {
+                state.selectedFolder = next;
+              }
+              logActivity(`Carpeta renombrada: ${f.folder} -> ${next}`);
+              await loadTree();
+            } catch (err) {
+              showToast(`Error al renombrar carpeta: ${err.message}`, "warn");
+              logActivity(`Error al renombrar carpeta: ${err.message}`);
+              restoreLabel();
+            }
+          };
+
+          input.onclick = (ev) => ev.stopPropagation();
+          input.onkeydown = (ev) => {
+            ev.stopPropagation();
+            if (ev.key === "Enter") {
+              ev.preventDefault();
+              commitRename();
+            } else if (ev.key === "Escape") {
+              ev.preventDefault();
+              committed = true;
+              restoreLabel();
+            }
+          };
+          input.onblur = () => commitRename();
+
+          countPill.classList.add("hidden");
+          renameBtn.classList.add("hidden");
+          li.replaceChild(input, labelSpan);
+          input.focus();
+          input.setSelectionRange(input.value.length, input.value.length);
+        };
+
+        li.appendChild(labelSpan);
+        li.appendChild(countPill);
+        li.appendChild(renameBtn);
+        li.onclick = selectFolder;
+        li.onkeydown = (e) => {
+          if (e.target && e.target.tagName === "INPUT") return;
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            selectFolder();
+          } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            const allItems = Array.from(folderList.querySelectorAll(".folder-item"));
+            const idx = allItems.indexOf(li);
+            const nextIdx = e.key === "ArrowDown" ? idx + 1 : idx - 1;
+            if (nextIdx >= 0 && nextIdx < allItems.length) {
+              allItems[nextIdx].focus();
+            }
+          }
+        };
+        subList.appendChild(li);
+      }
+
+      groupLi.append(headerBtn, subList);
+      folderList.appendChild(groupLi);
+    }
+  };
+
+  state.renderFolderTree = renderFolderTree;
+  renderFolderTree();
 
   $("current-folder-title").textContent = state.selectedFolder || "Todos los elementos";
   if ($("btn-clear-folder-filter")) {
@@ -445,13 +558,8 @@ async function loadTree() {
     nameEl.className = "item-name";
     nameEl.textContent = item.target_filename || "";
 
-    const subEl = document.createElement("div");
-    subEl.className = "item-sub";
-    subEl.textContent = item.target_folder || "";
-
     card.appendChild(img);
     card.appendChild(nameEl);
-    card.appendChild(subEl);
     card.onclick = () => showPreview(item);
     card.onkeydown = (e) => {
       if (e.key === "Enter" || e.key === " ") {
@@ -464,6 +572,10 @@ async function loadTree() {
 }
 
 function showPreview(item) {
+  const pane = $("preview-pane");
+  if (pane) {
+    pane.classList.remove("hidden");
+  }
   const box = $("preview-box");
   box.innerHTML = "";
 
@@ -1223,6 +1335,67 @@ function bindEvents() {
       restore();
     }
   };
+
+  if ($("btn-close-preview")) {
+    $("btn-close-preview").onclick = () => {
+      $("preview-pane")?.classList.add("hidden");
+    };
+  }
+
+  if ($("folder-filter-input")) {
+    $("folder-filter-input").addEventListener("input", (e) => {
+      state.folderFilter = e.target.value || "";
+      if (typeof state.renderFolderTree === "function") {
+        state.renderFolderTree();
+      }
+    });
+  }
+
+  const resizer = $("workspace-resizer");
+  const workspaceEl = document.querySelector(".workspace");
+  if (resizer && workspaceEl) {
+    let isResizing = false;
+
+    const updateTreeWidth = (clientX) => {
+      const rect = workspaceEl.getBoundingClientRect();
+      const nextWidth = Math.max(220, Math.min(640, Math.round(clientX - rect.left)));
+      workspaceEl.style.setProperty("--tree-width", `${nextWidth}px`);
+    };
+
+    const stopResize = () => {
+      if (!isResizing) return;
+      isResizing = false;
+      resizer.classList.remove("dragging");
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    };
+
+    resizer.addEventListener("pointerdown", (e) => {
+      isResizing = true;
+      resizer.classList.add("dragging");
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = "col-resize";
+      e.preventDefault();
+    });
+
+    window.addEventListener("pointermove", (e) => {
+      if (!isResizing) return;
+      updateTreeWidth(e.clientX);
+    });
+
+    window.addEventListener("pointerup", stopResize);
+
+    resizer.addEventListener("keydown", (e) => {
+      const current = parseInt(getComputedStyle(workspaceEl).getPropertyValue("--tree-width"), 10) || 360;
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        workspaceEl.style.setProperty("--tree-width", `${Math.max(220, current - 20)}px`);
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        workspaceEl.style.setProperty("--tree-width", `${Math.min(640, current + 20)}px`);
+      }
+    });
+  }
 
   if ($("btn-clear-folder-filter")) {
     $("btn-clear-folder-filter").onclick = () => {

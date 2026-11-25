@@ -652,26 +652,73 @@ progress {
   gap: 0.25rem;
 }
 
-/* 4. Main 3-column workspace prioritized */
+/* 4. Main Apple Photos / Finder-inspired workspace */
 .workspace {
   flex: 1;
-  display: grid;
-  grid-template-columns: 260px 1fr 290px;
+  display: flex;
+  min-height: 0;
+  --tree-width: 360px;
+}
+
+.tree-pane {
+  width: var(--tree-width, 360px);
+  min-width: 220px;
+  max-width: 640px;
+  flex-shrink: 0;
+  padding: 0.75rem 0.9rem;
+  overflow-y: auto;
+  overflow-x: hidden;
   min-height: 0;
 }
 
-.tree-pane,
-.items-pane,
-.preview-pane {
-  padding: 0.75rem 0.9rem;
-  border-right: 1px solid var(--border);
+.workspace-resizer {
+  width: 6px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  position: relative;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+
+.workspace-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 1px;
+  background: var(--border);
+  transition: background 0.15s ease, width 0.15s ease;
+}
+
+.workspace-resizer:hover::after,
+.workspace-resizer.dragging::after {
+  width: 2px;
+  background: var(--accent);
+}
+
+.items-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  padding: 0.75rem 1rem;
   overflow-y: auto;
   overflow-x: hidden;
-  min-width: 0;
 }
 
 .preview-pane {
-  border-right: none;
+  width: 320px;
+  flex-shrink: 0;
+  padding: 0.75rem 0.9rem;
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 0;
+  min-height: 0;
+}
+
+.preview-pane.hidden {
+  display: none !important;
 }
 
 .pane-header {
@@ -681,6 +728,22 @@ progress {
   align-items: center;
   gap: 0.5rem;
   margin-bottom: 0.6rem;
+}
+
+.tree-pane-header {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.45rem;
+}
+
+.folder-filter-input {
+  width: 100%;
+  font-size: 0.76rem;
+  padding: 0.32rem 0.55rem;
+  border-radius: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
 }
 
 .pane-header h2,
@@ -697,15 +760,72 @@ progress {
   margin: 0;
   display: flex;
   flex-direction: column;
+  gap: 0.35rem;
+}
+
+.folder-group {
+  display: flex;
+  flex-direction: column;
   gap: 0.15rem;
+}
+
+.folder-group-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 0.3rem 0.35rem;
+  border-radius: 5px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.folder-group-header:hover {
+  color: var(--text);
+  background: var(--panel);
+}
+
+.folder-group-title {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-group-chevron {
+  font-size: 0.7rem;
+  flex-shrink: 0;
+}
+
+.folder-group-items {
+  list-style: none;
+  padding: 0 0 0 0.35rem;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.folder-group-items.collapsed {
+  display: none;
 }
 
 .folder-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 0.35rem;
-  padding: 0.35rem 0.5rem;
+  gap: 0.4rem;
+  padding: 0.38rem 0.5rem;
   border-radius: 6px;
   cursor: pointer;
   font-size: 0.8rem;
@@ -720,18 +840,40 @@ progress {
 .folder-label {
   flex: 1;
   min-width: 0;
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.3;
+  word-break: break-word;
+}
+
+.folder-count {
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  padding: 0.1rem 0.42rem;
+  border-radius: 999px;
+  background: var(--panel-elevated);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+.folder-item.active .folder-count {
+  color: var(--accent);
+  border-color: rgba(94, 106, 210, 0.35);
 }
 
 .btn-inline-rename {
+  flex-shrink: 0;
   background: transparent;
   border: none;
   color: inherit;
   cursor: pointer;
   opacity: 0.55;
-  padding: 0.1rem 0.22rem;
+  padding: 0.12rem 0.24rem;
   font-size: 0.8rem;
   line-height: 1;
   border-radius: 4px;
@@ -752,8 +894,8 @@ progress {
 
 .items-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
-  gap: 0.65rem;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 0.75rem;
 }
 
 .empty-state {
@@ -792,9 +934,13 @@ progress {
 .item-card {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 10px;
   padding: 0.4rem;
   cursor: pointer;
+  aspect-ratio: 1 / 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   transition: border-color 0.12s ease;
 }
 
@@ -804,23 +950,20 @@ progress {
 
 .item-card img {
   width: 100%;
-  height: 108px;
+  flex: 1;
+  min-height: 0;
   object-fit: cover;
-  border-radius: 5px;
+  border-radius: 6px;
   background: #0c0e14;
 }
 
 .item-name {
   font-size: 0.74rem;
-  margin-top: 0.3rem;
+  margin-top: 0.32rem;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.item-sub {
-  font-size: 0.68rem;
-  color: var(--muted);
+  flex-shrink: 0;
 }
 
 .preview-img {
@@ -995,8 +1138,12 @@ progress {
 }
 
 @media (max-width: 1024px) {
-  .workspace {
-    grid-template-columns: 220px 1fr 240px;
+  .tree-pane {
+    width: 260px;
+  }
+
+  .preview-pane {
+    width: 260px;
   }
 }
 
@@ -1017,12 +1164,19 @@ progress {
   }
 
   .workspace {
-    grid-template-columns: 1fr;
+    flex-direction: column;
+  }
+
+  .workspace-resizer {
+    display: none;
   }
 
   .tree-pane,
   .items-pane,
   .preview-pane {
+    width: 100%;
+    max-width: none;
+    border-left: none;
     border-right: none;
     border-bottom: 1px solid var(--border);
   }

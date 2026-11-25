@@ -184,11 +184,27 @@
 
     <main class="workspace">
       <aside class="tree-pane" role="region" aria-label="Árbol de carpetas propuesto">
-        <div class="pane-header">
+        <div class="pane-header tree-pane-header">
           <h2>Árbol Propuesto</h2>
+          <input
+            id="folder-filter-input"
+            type="search"
+            class="folder-filter-input"
+            placeholder="Filtrar carpetas..."
+            aria-label="Filtrar carpetas"
+          />
         </div>
         <ul id="folder-list" class="folder-list" role="tree" aria-label="Carpetas"></ul>
       </aside>
+
+      <div
+        id="workspace-resizer"
+        class="workspace-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Redimensionar árbol de carpetas"
+        tabindex="0"
+      ></div>
 
       <section class="items-pane" role="region" aria-label="Elementos de la carpeta">
         <div class="pane-header">
@@ -211,9 +227,10 @@
         </div>
       </section>
 
-      <aside class="preview-pane" role="region" aria-label="Vista previa y metadatos" aria-live="polite">
+      <aside id="preview-pane" class="preview-pane hidden" role="region" aria-label="Vista previa y metadatos" aria-live="polite">
         <div class="pane-header">
           <h2>Vista Previa</h2>
+          <button id="btn-close-preview" type="button" class="btn small secondary" aria-label="Cerrar vista previa">× Cerrar</button>
         </div>
         <div id="preview-box" class="preview-box">
           <p class="muted">Selecciona un elemento para ver su miniatura y metadatos.</p>
