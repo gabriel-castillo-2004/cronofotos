@@ -612,6 +612,25 @@ progress {
   display: none !important;
 }
 
+.folder-item.is-loading {
+  opacity: 0.6;
+  pointer-events: none;
+  position: relative;
+}
+
+.folder-item.is-loading::after {
+  content: "";
+  display: inline-block;
+  width: 0.75em;
+  height: 0.75em;
+  margin-left: 0.45rem;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  vertical-align: middle;
+  animation: spin 0.7s linear infinite;
+}
+
 .spinner {
   display: inline-block;
   width: 0.85em;

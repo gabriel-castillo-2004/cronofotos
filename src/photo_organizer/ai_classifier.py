@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 import threading
@@ -14,6 +15,7 @@ from typing import Any, Callable
 from photo_organizer.config import AGY_ALLOWED_NAMES, is_standard_agy_binary, resolve_cli_binary
 from photo_organizer.db import init_db, open_connection
 
+logger = logging.getLogger(__name__)
 DEFAULT_AGY_MODEL = "gemini-4-hydrogen-medium"
 _ORIG_SUBPROCESS_RUN = subprocess.run
 
@@ -81,7 +83,8 @@ def _parse_agy_output(stdout: str) -> str:
                     val = parsed.get(key)
                     if isinstance(val, str) and val.strip():
                         return _clean_label(val)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Salida JSON malformada o truncada de agy: %s", exc)
             continue
 
     # If the output looks like truncated/malformed JSON, let the caller fall back cleanly
@@ -215,8 +218,8 @@ def classify_with_agy(
                 parsed = _parse_agy_output(stdout_data)
                 if parsed:
                     return parsed
-    except (OSError, subprocess.SubprocessError):
-        pass
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        logger.warning("Error ejecutando o parseando salida de agy: %s", exc)
     return heuristic_classify(prompt_key)
 
 

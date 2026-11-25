@@ -223,7 +223,7 @@ def recompute_filenames(conn: sqlite3.Connection, job_id: str, folder: str) -> i
     for idx, (_new_name, item_id) in enumerate(updates):
         conn.execute(
             "UPDATE media_items SET target_filename = ? WHERE id = ?",
-            (f"__tmp_{idx}_{item_id}", item_id),
+            (f"tmp-{idx}-{item_id}", item_id),
         )
     # Phase 2: assign final deterministic names
     for new_name, item_id in updates:

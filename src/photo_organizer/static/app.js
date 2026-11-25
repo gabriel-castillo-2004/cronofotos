@@ -254,6 +254,7 @@ async function loadTree() {
     const li = document.createElement("li");
     const isActive = state.selectedFolder === f.folder;
     li.className = `folder-item ${isActive ? "active" : ""}`;
+    li.dataset.folder = f.folder;
     li.setAttribute("role", "treeitem");
     li.setAttribute("aria-selected", isActive ? "true" : "false");
     li.tabIndex = 0;
@@ -462,38 +463,98 @@ function bindEvents() {
     }
   };
 
+  const setTreeMutationBusy = (folderName, activeBtnId, busyText) => {
+    const treeBtnIds = ["btn-rename-folder", "btn-merge-folder", "btn-create-folder"];
+    const originals = {};
+    for (const id of treeBtnIds) {
+      const el = $(id);
+      if (!el) continue;
+      originals[id] = el.textContent;
+      el.disabled = true;
+      if (id === activeBtnId && busyText) {
+        el.innerHTML = `<span class="spinner" aria-hidden="true"></span> ${busyText}`;
+      }
+    }
+    const nodeEl =
+      Array.from(document.querySelectorAll(".folder-item")).find(
+        (el) => el.dataset.folder === folderName
+      ) || document.querySelector(".folder-item.active");
+    if (nodeEl) {
+      nodeEl.classList.add("is-loading");
+      nodeEl.setAttribute("aria-busy", "true");
+    }
+    return () => {
+      if (nodeEl) {
+        nodeEl.classList.remove("is-loading");
+        nodeEl.removeAttribute("aria-busy");
+      }
+      for (const id of treeBtnIds) {
+        const el = $(id);
+        if (!el) continue;
+        el.disabled = false;
+        if (originals[id] !== undefined) {
+          el.textContent = originals[id];
+        }
+      }
+    };
+  };
+
   $("btn-rename-folder").onclick = async () => {
     if (!state.jobId || !state.selectedFolder) return;
     const next = prompt("Nuevo nombre de carpeta:", state.selectedFolder);
     if (!next) return;
-    await api("/api/tree/folders/rename", "POST", {
-      job_id: state.jobId,
-      old_folder: state.selectedFolder,
-      new_folder: next,
-    });
-    state.selectedFolder = next;
-    await loadTree();
+    const restore = setTreeMutationBusy(state.selectedFolder, "btn-rename-folder", "Renombrando...");
+    try {
+      await api("/api/tree/folders/rename", "POST", {
+        job_id: state.jobId,
+        old_folder: state.selectedFolder,
+        new_folder: next,
+      });
+      state.selectedFolder = next;
+      await loadTree();
+    } catch (err) {
+      showToast(`Error al renombrar carpeta: ${err.message}`, "warn");
+      logActivity(`Error al renombrar carpeta: ${err.message}`);
+    } finally {
+      restore();
+    }
   };
 
   $("btn-merge-folder").onclick = async () => {
     if (!state.jobId || !state.selectedFolder) return;
     const dest = prompt(`Fusionar '${state.selectedFolder}' dentro de:`, "");
     if (!dest) return;
-    await api("/api/tree/folders/merge", "POST", {
-      job_id: state.jobId,
-      from_folder: state.selectedFolder,
-      to_folder: dest,
-    });
-    state.selectedFolder = dest;
-    await loadTree();
+    const restore = setTreeMutationBusy(state.selectedFolder, "btn-merge-folder", "Fusionando...");
+    try {
+      await api("/api/tree/folders/merge", "POST", {
+        job_id: state.jobId,
+        from_folder: state.selectedFolder,
+        to_folder: dest,
+      });
+      state.selectedFolder = dest;
+      await loadTree();
+    } catch (err) {
+      showToast(`Error al fusionar carpeta: ${err.message}`, "warn");
+      logActivity(`Error al fusionar carpeta: ${err.message}`);
+    } finally {
+      restore();
+    }
   };
 
   $("btn-create-folder").onclick = async () => {
     if (!state.jobId) return;
     const folder = prompt("Nombre de la nueva carpeta:", "01_Recuerdos/2024/2024-01 - Nuevo");
     if (!folder) return;
-    await api("/api/tree/folders/create", "POST", { job_id: state.jobId, folder });
-    await loadTree();
+    const restore = setTreeMutationBusy(state.selectedFolder, "btn-create-folder", "Creando...");
+    try {
+      await api("/api/tree/folders/create", "POST", { job_id: state.jobId, folder });
+      await loadTree();
+    } catch (err) {
+      showToast(`Error al crear carpeta: ${err.message}`, "warn");
+      logActivity(`Error al crear carpeta: ${err.message}`);
+    } finally {
+      restore();
+    }
   };
 
   $("btn-settings").onclick = async () => {

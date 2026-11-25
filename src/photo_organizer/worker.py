@@ -427,7 +427,7 @@ class PipelineOrchestrator:
                                     merged.get("longitude"),
                                     sidecar_res.get("sidecar_path"),
                                     json.dumps(merged),
-                                    f"__skipped_{item_id}{ext}",
+                                    f"omitido_{item_id}{ext}",
                                 ),
                             )
                             processed_total += 1
@@ -475,7 +475,7 @@ class PipelineOrchestrator:
                                 merged.get("longitude"),
                                 sidecar_res.get("sidecar_path"),
                                 json.dumps(merged),
-                                f"__staging_{item_id}{ext}",
+                                f"pendiente_{item_id}{ext}",
                             ),
                         )
                         processed_total += 1
