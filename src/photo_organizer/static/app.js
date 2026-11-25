@@ -650,12 +650,90 @@ function bindEvents() {
     }
   };
 
+  async function loadPeople() {
+    const list = $("people-list");
+    if (!list) return;
+    try {
+      const data = await api("/api/people");
+      const people = Array.isArray(data.people) ? data.people : [];
+      list.innerHTML = "";
+      if (people.length === 0) {
+        const empty = document.createElement("span");
+        empty.className = "muted";
+        empty.style.fontSize = "0.82rem";
+        empty.textContent = "Sin personas clave registradas.";
+        list.appendChild(empty);
+        return;
+      }
+      for (const p of people) {
+        const chip = document.createElement("div");
+        chip.className = "person-chip";
+        chip.style.cssText = "display:inline-flex;align-items:center;gap:0.4rem;padding:0.25rem 0.5rem;border:1px solid var(--border, #334155);border-radius:6px;";
+        if (p.url) {
+          const img = document.createElement("img");
+          img.src = p.url;
+          img.alt = p.label || "Persona";
+          img.style.cssText = "width:28px;height:28px;object-fit:cover;border-radius:4px;";
+          chip.appendChild(img);
+        }
+        const lbl = document.createElement("span");
+        lbl.textContent = p.label || p.id;
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "btn small";
+        del.textContent = "×";
+        del.title = `Eliminar ${p.label || p.id}`;
+        del.onclick = async () => {
+          try {
+            await api(`/api/people/${encodeURIComponent(p.id)}`, "DELETE");
+            logActivity(`Persona clave eliminada: ${p.label || p.id}`);
+            await loadPeople();
+          } catch (err) {
+            showToast(`Error al eliminar persona: ${err.message}`, "warn");
+          }
+        };
+        chip.append(lbl, del);
+        list.appendChild(chip);
+      }
+    } catch (err) {
+      logActivity(`Error cargando personas clave: ${err.message}`);
+    }
+  }
+
+  if ($("btn-add-person")) {
+    $("btn-add-person").onclick = async () => {
+      const label = ($("person-label")?.value || "").trim();
+      const fileInput = $("person-file");
+      const file = fileInput?.files?.[0];
+      if (!label) return showToast("Escribe una etiqueta para la persona (ej. Mamá).", "warn");
+      if (!file) return showToast("Selecciona una foto de referencia.", "warn");
+      const fd = new FormData();
+      fd.append("label", label);
+      fd.append("file", file);
+      try {
+        const res = await fetch("/api/people", { method: "POST", body: fd });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }));
+          throw new Error(err.detail || "Error al subir foto");
+        }
+        if ($("person-label")) $("person-label").value = "";
+        if (fileInput) fileInput.value = "";
+        logActivity(`Persona clave agregada: ${label}`);
+        await loadPeople();
+      } catch (err) {
+        showToast(`Error al agregar persona: ${err.message}`, "warn");
+        logActivity(`Error al agregar persona clave: ${err.message}`);
+      }
+    };
+  }
+
   $("btn-settings").onclick = async () => {
     const cfg = await api("/api/settings");
     $("cfg-exiftool").value = cfg.exiftool_path || "";
     $("cfg-ffmpeg").value = cfg.ffmpeg_path || "";
     $("cfg-antigravity-cli").value = cfg.antigravity_cli || "agy";
     $("cfg-antigravity-model").value = cfg.model || "gemini-4-hydrogen-medium";
+    await loadPeople();
     $("settings-modal").showModal();
   };
 
@@ -704,6 +782,9 @@ function bindEvents() {
         $("progress-stage").textContent = `Estado: ${msg}`;
         showToast(msg, res.cancelled ? "warn" : "ok");
         logActivity(msg);
+        if (res.error_reason) {
+          logActivity(`Motivo fallo agy: ${res.error_reason}`);
+        }
         await loadTree();
       } catch (err) {
         showToast(`Error al regenerar nombres: ${err.message}`, "warn");
@@ -793,6 +874,9 @@ function bindEvents() {
         $("progress-stage").textContent = `Estado: ${msg}`;
         showToast(msg, engineLabel.toLowerCase().includes("fallback") ? "warn" : "ok");
         logActivity(msg);
+        if (res.error_reason) {
+          logActivity(`Motivo fallo agy: ${res.error_reason}`);
+        }
       } catch (err) {
         showToast(`Error al analizar árbol: ${err.message}`, "warn");
         logActivity(`Error al analizar árbol: ${err.message}`);

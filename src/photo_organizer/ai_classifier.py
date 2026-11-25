@@ -16,7 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from photo_organizer.config import AGY_ALLOWED_NAMES, is_standard_agy_binary, resolve_cli_binary
+from photo_organizer.config import (
+    AGY_ALLOWED_NAMES,
+    PEOPLE_IMAGE_EXTENSIONS,
+    is_standard_agy_binary,
+    resolve_cli_binary,
+)
+from photo_organizer.thumbnails import extract_top_face_crops
 from photo_organizer.db import init_db, open_connection
 
 logger = logging.getLogger(__name__)
@@ -167,6 +173,9 @@ def classify_with_agy(
     model: str = DEFAULT_AGY_MODEL,
     timeout: float = 15.0,
     cancel_event: threading.Event | None = None,
+    people_dir: Path | str | None = None,
+    add_dirs: list[Path | str] | None = None,
+    error_out: dict[str, str] | None = None,
 ) -> str:
     """Invoke local Antigravity CLI (`agy`) via subprocess with heuristic fallback."""
     if cancel_event is not None and cancel_event.is_set():
@@ -180,13 +189,23 @@ def classify_with_agy(
         return heuristic_classify(prompt_key)
 
     selected_model = (model or DEFAULT_AGY_MODEL).strip() or DEFAULT_AGY_MODEL
+    people_labels = _load_people_labels(people_dir)
+    people_hint = (
+        f" Personas clave de referencia disponibles: {', '.join(people_labels)}."
+        if people_labels
+        else ""
+    )
     prompt = (
         "Responde únicamente con un JSON válido de la forma "
         '{"nombre_evento": "Nombre Corto en Español"} '
-        "(máximo 3 palabras, sin explicación adicional) para este grupo de fotos: "
-        f"{prompt_key}"
+        "(máximo 6 palabras, sin explicación adicional) identificando el evento y, "
+        f"si aparecen personas clave de referencia, inclúyelas.{people_hint} "
+        f"Grupo de fotos: {prompt_key}"
     )
-    argv = [resolved_bin or cmd_bin, "-m", selected_model, "-p", prompt]
+    argv = [resolved_bin or cmd_bin, "-m", selected_model]
+    for d in _collect_add_dirs(people_dir, add_dirs):
+        argv.extend(["--add-dir", str(d)])
+    argv.extend(["-p", prompt])
     try:
         if subprocess.run is not _ORIG_SUBPROCESS_RUN:
             proc = subprocess.run(
@@ -200,6 +219,9 @@ def classify_with_agy(
                 parsed = _parse_agy_output(proc.stdout)
                 if parsed:
                     return parsed
+            elif proc.returncode != 0 and error_out is not None:
+                detail = _summarize_failure_reason(proc.stderr or proc.stdout)
+                error_out["reason"] = f"código {proc.returncode}: {detail}" if detail else f"código {proc.returncode}"
         else:
             proc_p = subprocess.Popen(
                 argv,
@@ -215,14 +237,21 @@ def classify_with_agy(
                         proc_p.wait(timeout=1.0)
                     except subprocess.TimeoutExpired:
                         proc_p.kill()
+                    if error_out is not None and (cancel_event is None or not cancel_event.is_set()):
+                        error_out["reason"] = "tiempo de espera agotado"
                     return heuristic_classify(prompt_key)
                 time.sleep(0.05)
-            stdout_data, _ = proc_p.communicate()
+            stdout_data, stderr_data = proc_p.communicate()
             if proc_p.returncode == 0 and stdout_data:
                 parsed = _parse_agy_output(stdout_data)
                 if parsed:
                     return parsed
+            elif proc_p.returncode != 0 and error_out is not None:
+                detail = _summarize_failure_reason(stderr_data or stdout_data)
+                error_out["reason"] = f"código {proc_p.returncode}: {detail}" if detail else f"código {proc_p.returncode}"
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        if error_out is not None:
+            error_out["reason"] = _summarize_failure_reason(str(exc)) or "error ejecutando agy"
         logger.warning("Error ejecutando o parseando salida de agy: %s", exc)
     return heuristic_classify(prompt_key)
 
@@ -665,6 +694,84 @@ def _prepare_temp_thumb(src: Path, dst: Path, max_dim: int = 320) -> Path:
         return dst
 
 
+def _load_people_labels(people_dir: Path | str | None) -> list[str]:
+    """Read key-people labels from people.json or image filenames in `people_dir`."""
+    if not people_dir:
+        return []
+    pdir = Path(people_dir)
+    if not pdir.exists() or not pdir.is_dir():
+        return []
+    index_file = pdir / "people.json"
+    if index_file.is_file():
+        try:
+            data = json.loads(index_file.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                labels = [str(item.get("label", "")).strip() for item in data if isinstance(item, dict)]
+                labels = [lbl for lbl in labels if lbl]
+                if labels:
+                    return labels
+        except (OSError, json.JSONDecodeError):
+            pass
+    labels: list[str] = []
+    for f in sorted(pdir.iterdir()):
+        if f.is_file() and f.suffix.lower() in PEOPLE_IMAGE_EXTENSIONS:
+            stem = f.stem.split("__", 1)[0].replace("_", " ").strip()
+            if stem:
+                labels.append(stem)
+    return labels
+
+
+def _collect_add_dirs(
+    people_dir: Path | str | None,
+    extra_dirs: list[Path | str] | None = None,
+) -> list[Path]:
+    """Return deduplicated existing directories to pass via `--add-dir`."""
+    dirs: list[Path] = []
+    seen: set[Path] = set()
+    candidates: list[Path | str] = []
+    if extra_dirs:
+        candidates.extend(extra_dirs)
+    if people_dir:
+        pdir = Path(people_dir)
+        if pdir.exists() and pdir.is_dir():
+            has_imgs = any(
+                f.is_file() and f.suffix.lower() in PEOPLE_IMAGE_EXTENSIONS
+                for f in pdir.iterdir()
+            )
+            if has_imgs:
+                candidates.append(pdir)
+    for raw in candidates:
+        if not raw:
+            continue
+        p = Path(raw)
+        if p.exists() and p.is_dir():
+            res = p.resolve()
+            if res not in seen:
+                seen.add(res)
+                dirs.append(p)
+    return dirs
+
+
+def _collect_candidate_image_paths(folder_info: dict[str, Any]) -> list[Path]:
+    """Collect all existing candidate image paths for a folder."""
+    raw_list = folder_info.get("thumb_paths")
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    if isinstance(raw_list, (list, tuple)):
+        for item in raw_list:
+            if item:
+                p = Path(str(item))
+                if p.exists() and p.is_file() and p not in seen:
+                    seen.add(p)
+                    candidates.append(p)
+    if folder_info.get("thumb_path"):
+        p = Path(str(folder_info["thumb_path"]))
+        if p.exists() and p.is_file() and p not in seen:
+            seen.add(p)
+            candidates.append(p)
+    return candidates
+
+
 def _summarize_failure_reason(raw: str, max_len: int = 140) -> str:
     """Return a concise single-line technical failure reason."""
     lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
@@ -682,8 +789,9 @@ def suggest_tree_optimizations(
     timeout: float = 60.0,
     cancel_event: threading.Event | None = None,
     forbid_fixed_labels: bool = False,
+    people_dir: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Analyze folder metadata + up to 3 <=320px representative thumbnails per folder via agy."""
+    """Analyze folder metadata + 3 scene thumbs + up to 4 face crops + key people via agy."""
     if not folder_summaries:
         return {"engine": "Fallback determinista local", "suggestions": []}
 
@@ -713,6 +821,7 @@ def suggest_tree_optimizations(
     batch_size = 12
     all_suggestions: list[dict[str, Any]] = []
     failure_reason: str | None = None
+    people_labels = _load_people_labels(people_dir)
 
     for i in range(0, len(folder_summaries), batch_size):
         if cancel_event is not None and cancel_event.is_set():
@@ -730,9 +839,19 @@ def suggest_tree_optimizations(
             rep_srcs = _select_representative_thumb_paths(f, limit=3)
             prepared_paths: list[str] = []
             for t_idx, src_p in enumerate(rep_srcs):
-                dst_p = tmp_root / f"folder_{f_idx:02d}_thumb_{t_idx + 1}.jpg"
+                dst_p = tmp_root / f"folder_{f_idx:02d}_scene_{t_idx + 1}.jpg"
                 _prepare_temp_thumb(src_p, dst_p, max_dim=320)
                 prepared_paths.append(str(dst_p))
+                has_prepared_thumbs = True
+
+            candidate_paths = _collect_candidate_image_paths(f)
+            face_crops = extract_top_face_crops(
+                candidate_paths,
+                tmp_root,
+                max_faces=4,
+                file_prefix=f"folder_{f_idx:02d}_face",
+            )
+            if face_crops:
                 has_prepared_thumbs = True
 
             compact.append(
@@ -745,11 +864,14 @@ def suggest_tree_optimizations(
                     "max_gap_hours": f.get("max_gap_hours"),
                     "is_midnight_merged": bool(f.get("is_midnight_merged", False)),
                     "thumbnails": prepared_paths if prepared_paths else ([f.get("thumb_path")] if f.get("thumb_path") else []),
+                    "face_crops": [str(p) for p in face_crops],
                 }
             )
 
-        add_dir: str | None = str(tmp_root) if has_prepared_thumbs else None
-        if add_dir is None:
+        extra_dirs: list[Path | str] = []
+        if has_prepared_thumbs:
+            extra_dirs.append(tmp_root)
+        else:
             thumb_dirs = [
                 str(Path(str(f["thumb_path"])).parent)
                 for f in chunk
@@ -758,16 +880,25 @@ def suggest_tree_optimizations(
             if thumb_dirs:
                 try:
                     common = Path(os.path.commonpath(thumb_dirs))
-                    add_dir = str(common) if common.exists() else thumb_dirs[0]
+                    extra_dirs.append(common if common.exists() else Path(thumb_dirs[0]))
                 except ValueError:
-                    add_dir = thumb_dirs[0]
+                    extra_dirs.append(Path(thumb_dirs[0]))
+
+        add_dirs = _collect_add_dirs(people_dir, extra_dirs)
+        people_hint = (
+            f" Personas clave de referencia en personas_referencia/: {', '.join(people_labels)}."
+            if people_labels
+            else ""
+        )
 
         prompt = (
-            "Lee directamente desde disco los archivos de imagen adjuntos en el directorio (--add-dir) "
-            "para cada carpeta (hasta 3 miniaturas por carpeta: inicio, mitad y 75%) "
-            "para identificar la actividad, evento, recinto o artista visible "
-            "(ej. 'Concierto de Luis Miguel', 'Cena Familiar', 'Senderismo en Montaña') "
-            "y propón sugerencias `rename` enriqueciendo el nombre actual de la carpeta aunque ya tenga ubicación GPS. "
+            "Lee directamente desde disco los archivos de imagen adjuntos en los directorios (--add-dir): "
+            "hasta 3 miniaturas de escena por carpeta (inicio, mitad y 75%), hasta 4 recortes de rostros cercanos "
+            "y las fotos de referencia de personas clave si existen. "
+            "Identifica la actividad, evento, recinto o artista visible y las personas clave presentes "
+            "(ej. 'Concierto de Luis Miguel con Mamá (Iztacalco)', 'Cena Familiar', 'Senderismo en Montaña') "
+            "y propón sugerencias `rename` enriqueciendo el nombre actual de la carpeta aunque ya tenga ubicación GPS."
+            f"{people_hint} "
             "Analiza estas carpetas (máximo 12 por lote) y responde ÚNICAMENTE con JSON válido "
             '{"suggestions": [{"type": "rename|merge|split", "before": ..., "after": ..., "reason": "..."}]}. '
             "Reglas: usa títulos descriptivos reales en español según lo que se ve en cada imagen; "
@@ -776,8 +907,8 @@ def suggest_tree_optimizations(
             "Carpetas: " + json.dumps(compact, ensure_ascii=False)
         )
         argv = [resolved_bin or cmd_bin, "-m", selected_model]
-        if add_dir:
-            argv.extend(["--add-dir", add_dir])
+        for add_d in add_dirs:
+            argv.extend(["--add-dir", str(add_d)])
         argv.extend(["-p", prompt])
         try:
             proc = subprocess.run(
@@ -834,6 +965,7 @@ def generate_tree_ai_suggestions(
     model: str = DEFAULT_AGY_MODEL,
     timeout: float = 60.0,
     cancel_event: threading.Event | None = None,
+    people_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Visual + structural tree optimization via agy (--add-dir) forbidding fixed session labels."""
     return suggest_tree_optimizations(
@@ -843,4 +975,5 @@ def generate_tree_ai_suggestions(
         timeout=timeout,
         cancel_event=cancel_event,
         forbid_fixed_labels=True,
+        people_dir=people_dir,
     )

@@ -235,6 +235,18 @@
             <option value="gemini-4-neon-medium">gemini-4-neon-medium</option>
           </select>
         </label>
+        <section class="people-section" aria-label="Personas Clave">
+          <h4>Personas Clave (Reconocimiento en carpetas)</h4>
+          <p class="muted" style="font-size:0.82rem;margin:0 0 0.5rem;">
+            Sube fotos de referencia (ej. Yo (ancla), Mamá, Papá, Pareja) para identificarlas al nombrar carpetas.
+          </p>
+          <div class="people-add-row" style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-bottom:0.5rem;">
+            <input id="person-label" type="text" placeholder="Etiqueta (ej. Mamá)" style="flex:1;min-width:130px;" />
+            <input id="person-file" type="file" accept=".jpg,.jpeg,.png,.webp,image/*" style="flex:1;min-width:160px;" />
+            <button id="btn-add-person" type="button" class="btn secondary small">Agregar</button>
+          </div>
+          <div id="people-list" class="people-list" style="display:flex;flex-wrap:wrap;gap:0.5rem;"></div>
+        </section>
         <div class="modal-actions">
           <button id="btn-close-settings" type="button" class="btn secondary">Cancelar</button>
           <button type="submit" class="btn primary">Guardar</button>
