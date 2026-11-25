@@ -517,6 +517,8 @@ function bindEvents() {
     const gpsDistEl = $("gps-distance-km");
     const time_gap_hours = timeGapEl ? Math.max(0.5, Number(timeGapEl.value) || 4) : 4;
     const gps_distance_km = gpsDistEl ? Math.max(1, Number(gpsDistEl.value) || 25) : 25;
+    const incremental_mode = Boolean($("incremental-mode")?.checked);
+    const master_index_path = $("master-index-path")?.value.trim() || null;
     try {
       const snap = await api("/api/scan/start", "POST", {
         source_dir,
@@ -525,6 +527,9 @@ function bindEvents() {
         solo_primer_lote,
         time_gap_hours,
         gps_distance_km,
+        incremental_mode,
+        incremental: incremental_mode,
+        master_index_path,
       });
       updateProgressUI(snap);
       connectSSE();
@@ -980,6 +985,8 @@ function bindEvents() {
     if (!state.jobId) return showToast("Primero ejecuta Organizar Automáticamente.", "warn");
     if (!confirm("¿Aplicar y Exportar Árbol al directorio destino?")) return;
     const { batch_size, solo_primer_lote } = getBatchOptions();
+    const incremental_mode = Boolean($("incremental-mode")?.checked);
+    const master_index_path = $("master-index-path")?.value.trim() || null;
     const restore = setActionBusy("btn-export", "Exportando archivos...");
     $("progress-stage").textContent = "Estado: Exportando archivos...";
     logActivity("Iniciando exportación física al directorio destino...");
@@ -988,6 +995,9 @@ function bindEvents() {
         job_id: state.jobId,
         batch_size,
         solo_primer_lote,
+        incremental_mode,
+        incremental: incremental_mode,
+        master_index_path,
       });
       if (Array.isArray(res.batches)) {
         renderBatches(res.batches);

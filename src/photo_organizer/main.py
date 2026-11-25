@@ -270,6 +270,10 @@ class _LocalAppCore:
         gps_distance_km = float(payload.get("gps_distance_km", 25.0))
         batch_size = int(payload.get("batch_size") or 100)
         solo_primer_lote = bool(payload.get("solo_primer_lote", False))
+        incremental_mode = bool(payload.get("incremental_mode") or payload.get("incremental") or False)
+        master_index_path = payload.get("master_index_path") or payload.get("previous_index_path")
+        if isinstance(master_index_path, str):
+            master_index_path = master_index_path.strip() or None
         if time_gap_hours <= 0 or gps_distance_km <= 0:
             raise _ApiError(400, "time_gap_hours and gps_distance_km must be positive.")
         try:
@@ -285,8 +289,14 @@ class _LocalAppCore:
                 gps_distance_km=gps_distance_km,
                 batch_size=batch_size,
                 solo_primer_lote=solo_primer_lote,
+                incremental_mode=incremental_mode,
+                master_index_path=master_index_path,
             )
             self.state["active_job_id"] = jid
+            self.state.setdefault("job_options", {})[jid] = {
+                "incremental_mode": incremental_mode,
+                "master_index_path": master_index_path,
+            }
 
         if loop is not None:
             self.state["job_task"] = loop.create_task(_runner())
@@ -1025,6 +1035,8 @@ class _LocalAppCore:
         job_id: str,
         batch_size: int = 100,
         solo_primer_lote: bool = False,
+        incremental_mode: bool | None = None,
+        master_index_path: str | None = None,
     ) -> dict[str, Any]:
         conn = open_connection(self.cfg.db_path)
         try:
@@ -1036,6 +1048,17 @@ class _LocalAppCore:
             conn.close()
         if not job:
             raise _ApiError(404, "Job not found")
+        job_opts = self.state.get("job_options", {}).get(job_id, {})
+        eff_incremental = (
+            bool(incremental_mode)
+            if incremental_mode is not None
+            else bool(job_opts.get("incremental_mode", False))
+        )
+        eff_master_index = (
+            master_index_path.strip() or None
+            if isinstance(master_index_path, str)
+            else job_opts.get("master_index_path")
+        )
         return run_two_phase_export(
             self.cfg.db_path,
             job_id,
@@ -1043,6 +1066,8 @@ class _LocalAppCore:
             self.media_service,
             batch_size=int(batch_size or 100),
             solo_primer_lote=bool(solo_primer_lote),
+            incremental_mode=eff_incremental,
+            master_index_path=eff_master_index,
         )
 
 
@@ -1055,6 +1080,10 @@ if FASTAPI_AVAILABLE:
         gps_distance_km: float = Field(default=25.0, gt=0.0)
         batch_size: int = Field(default=100, ge=1)
         solo_primer_lote: bool = False
+        incremental_mode: bool = False
+        incremental: bool = False
+        master_index_path: str | None = None
+        previous_index_path: str | None = None
 
     class FolderRenameRequest(BaseModel):
         job_id: str
@@ -1106,6 +1135,10 @@ if FASTAPI_AVAILABLE:
         job_id: str
         batch_size: int = Field(default=100, ge=1)
         solo_primer_lote: bool = False
+        incremental_mode: bool | None = None
+        incremental: bool | None = None
+        master_index_path: str | None = None
+        previous_index_path: str | None = None
 
     class OpenDestinationRequest(BaseModel):
         job_id: str | None = None
@@ -1298,12 +1331,18 @@ def create_app(config: OrganizerConfig | None = None) -> Any:
 
     @app.post("/api/export")
     async def export_tree(payload: ExportRequest) -> dict[str, Any]:
+        inc_val: bool | None = None
+        if payload.incremental_mode is not None or payload.incremental is not None:
+            inc_val = bool(payload.incremental_mode or payload.incremental)
+        idx_path = payload.master_index_path or payload.previous_index_path
         try:
             return await asyncio.to_thread(
                 core.export_tree,
                 payload.job_id,
                 payload.batch_size,
                 payload.solo_primer_lote,
+                inc_val,
+                idx_path,
             )
         except _ApiError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -1513,12 +1552,18 @@ def _make_stdlib_handler(core: _LocalAppCore) -> type[http.server.BaseHTTPReques
                 elif path == "/api/ai/cancel":
                     self._send_json(200, core.cancel_ai())
                 elif path == "/api/export":
+                    inc_val: bool | None = None
+                    if "incremental_mode" in body or "incremental" in body:
+                        inc_val = bool(body.get("incremental_mode") or body.get("incremental"))
+                    idx_path = body.get("master_index_path") or body.get("previous_index_path")
                     self._send_json(
                         200,
                         core.export_tree(
                             body["job_id"],
                             batch_size=int(body.get("batch_size") or 100),
                             solo_primer_lote=bool(body.get("solo_primer_lote", False)),
+                            incremental_mode=inc_val,
+                            master_index_path=idx_path,
                         ),
                     )
                 elif path == "/api/open-destination":
