@@ -67,10 +67,15 @@ async function refreshHealth() {
 
 function logActivity(message) {
   const list = $("activity-log");
-  if (!list) return;
+  const latest = $("activity-latest");
   const now = new Date().toLocaleTimeString("es-MX", { hour12: false });
+  const entryText = `[${now}] ${message}`;
+  if (latest) {
+    latest.textContent = entryText;
+  }
+  if (!list) return;
   const li = document.createElement("li");
-  li.textContent = `[${now}] ${message}`;
+  li.textContent = entryText;
   list.prepend(li);
   while (list.children.length > 60) {
     list.removeChild(list.lastChild);
@@ -194,7 +199,7 @@ function updateProgressUI(snap) {
   if ($("progress-phase")) $("progress-phase").textContent = phaseLabel;
   $("progress-stage").textContent = `Estado: ${snap.status}`;
   $("progress-stats").textContent =
-    `${snap.processed_files} / ${snap.total_files} archivos · ${snap.items_per_sec} items/s`;
+    `${snap.processed_files} / ${snap.total_files} archivos · ${snap.items_per_sec} archivos/s`;
 
   const pct = snap.total_files > 0 ? Math.round((snap.processed_files / snap.total_files) * 100) : 0;
   $("progress-bar").value = snap.status === "completed" ? 100 : pct;
@@ -463,6 +468,22 @@ function showPreview(item) {
 }
 
 function bindEvents() {
+  document.addEventListener("click", (e) => {
+    for (const menuId of ["ai-menu", "more-options-menu", "incremental-options", "activity-log-panel"]) {
+      const menu = $(menuId);
+      if (menu && menu.open && !menu.contains(e.target)) {
+        menu.open = false;
+      }
+    }
+  });
+
+  document.querySelectorAll(".dropdown-menu .menu-item").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const parentMenu = btn.closest("details.dropdown-menu");
+      if (parentMenu) parentMenu.open = false;
+    });
+  });
+
   const themeBtn = $("btn-theme");
   if (themeBtn) {
     themeBtn.onclick = () => {
