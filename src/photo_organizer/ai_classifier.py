@@ -59,7 +59,7 @@ def _clean_label(raw: str) -> str:
     """Sanitize an event label and strip template/punctuation artifacts."""
     cleaned = raw.strip().strip("\"'`")
     cleaned = re.sub(r"Fotos_Carpeta__Gps_[^\s]*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(?:fallback_|placeholder|sample_)[^\s]*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:fallback_|placeholder|sample_|template_|tmp_)[^\s]*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"__+", " ", cleaned)
     cleaned = re.sub(r"[<>:\"/\\|?*]+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -124,16 +124,21 @@ def heuristic_classify(prompt_key: str) -> str:
         gps_val = gps_match.group(1).strip() if gps_match else ""
 
         if folder_name and folder_name.lower() not in _GENERIC_FOLDER_NAMES:
+            sanitized_folder = _clean_label(folder_name)
             tokens = [
                 t
-                for t in re.split(r"[\s_\-]+", folder_name)
+                for t in re.split(r"[\s_\-]+", sanitized_folder)
                 if t and not t.isdigit() and len(t) > 1
             ]
             if tokens:
-                return _clean_label(" ".join(t.capitalize() for t in tokens[:4]))
+                res = _clean_label(" ".join(t.capitalize() for t in tokens[:4]))
+                if res:
+                    return res
 
         if gps_val and not re.match(r"^(?:gps\s*)?-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?$", gps_val, re.IGNORECASE):
-            return _clean_label(gps_val)
+            res = _clean_label(gps_val)
+            if res:
+                return res
 
         return "Eventos del día"
 
@@ -153,8 +158,8 @@ def heuristic_classify(prompt_key: str) -> str:
 
     parts = [p for p in re.split(r"[/\\]+", raw) if p]
     for part in parts:
-        stem = Path(part).stem
-        if stem.lower() in _GENERIC_FOLDER_NAMES:
+        stem = _clean_label(Path(part).stem)
+        if not stem or stem.lower() in _GENERIC_FOLDER_NAMES:
             continue
         tokens = [
             t
@@ -162,7 +167,9 @@ def heuristic_classify(prompt_key: str) -> str:
             if t and not t.isdigit() and len(t) > 2
         ]
         if tokens:
-            return _clean_label(" ".join(t.capitalize() for t in tokens[:3]))
+            res = _clean_label(" ".join(t.capitalize() for t in tokens[:3]))
+            if res:
+                return res
     return "Eventos del día"
 
 
@@ -1324,6 +1331,8 @@ def debate_folder_batch_with_agy(
                 or prop.get("proposed_name")
                 or ""
             ).strip()
+            if raw_name.startswith("01_Recuerdos/") and " - " in raw_name:
+                raw_name = raw_name.split(" - ", 1)[1].strip()
             clean_name = _clean_label(raw_name)
             merge_with = dec.get("merge_with")
             if isinstance(merge_with, str):
